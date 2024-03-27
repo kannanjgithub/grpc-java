@@ -24,10 +24,17 @@ import io.grpc.TlsChannelCredentials;
 import io.grpc.examples.helloworld.GreeterGrpc;
 import io.grpc.examples.helloworld.HelloReply;
 import io.grpc.examples.helloworld.HelloRequest;
+import io.grpc.util.AdvancedTlsX509TrustManager;
+import io.grpc.util.AdvancedTlsX509TrustManager.SslSocketAndEnginePeerVerifier;
+import io.grpc.util.AdvancedTlsX509TrustManager.Verification;
 import java.io.File;
+import java.net.Socket;
+import java.security.cert.CertificateException;
+import java.security.cert.X509Certificate;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import javax.net.ssl.SSLEngine;
 
 /**
  * A simple client that requests a greeting from the {@link HelloWorldServerTls} with TLS.
@@ -81,7 +88,37 @@ public class HelloWorldClientTls {
                 tlsBuilder.keyManager(new File(args[3]), new File(args[4]));
                 // fallthrough
             case 3:
-                tlsBuilder.trustManager(new File(args[2]));
+                AdvancedTlsX509TrustManager serverTrustManager = AdvancedTlsX509TrustManager.newBuilder()
+                    .setVerification(Verification.CERTIFICATE_ONLY_VERIFICATION)
+                    .setSslSocketAndEnginePeerVerifier(
+                        new SslSocketAndEnginePeerVerifier() {
+                            @Override
+                            public void verifyPeerCertificate(X509Certificate[] peerCertChain, String authType,
+                                Socket socket) throws CertificateException {
+                                if (peerCertChain == null || peerCertChain.length == 0) {
+                                    throw new CertificateException("peerCertChain is empty");
+                                }
+                                X509Certificate leafCert = peerCertChain[0];
+                                if (!leafCert.getSubjectX500Principal().getName().contains("testclient")) {
+                                    throw new CertificateException("SslSocketAndEnginePeerVerifier failed");
+                                }
+                            }
+
+                            @Override
+                            public void verifyPeerCertificate(X509Certificate[] peerCertChain, String authType,
+                                SSLEngine engine) throws CertificateException {
+                                if (peerCertChain == null || peerCertChain.length == 0) {
+                                    throw new CertificateException("peerCertChain is empty");
+                                }
+                                X509Certificate leafCert = peerCertChain[0];
+                                /*if (!leafCert.getSubjectX500Principal().getName().contains("testclient")) {
+                                    throw new CertificateException("SslSocketAndEnginePeerVerifier failed");
+                                }*/
+                            }
+                        })
+                    .build();
+                serverTrustManager.useSystemDefaultTrustCerts();
+                tlsBuilder.trustManager(serverTrustManager);
                 // fallthrough
             default:
         }

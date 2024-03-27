@@ -74,7 +74,9 @@ include ":grpc-istio-interop-testing"
 include ":grpc-inprocess"
 include ":grpc-util"
 include ":grpc-opentelemetry"
+include ":grpc-example-tls"
 
+project(':grpc-example-tls').projectDir = "$rootDir/examples/example-tls" as File
 project(':grpc-api').projectDir = "$rootDir/api" as File
 project(':grpc-core').projectDir = "$rootDir/core" as File
 project(':grpc-context').projectDir = "$rootDir/context" as File

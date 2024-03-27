@@ -179,7 +179,7 @@ public final class AdvancedTlsX509TrustManager extends X509ExtendedTrustManager 
       }
       if (checkingServer) {
         String algorithm = this.verification == Verification.CERTIFICATE_AND_HOST_NAME_VERIFICATION
-            ? "HTTPS" : "";
+            ? "HTTPS" : null;
         if (sslEngine != null) {
           SSLParameters sslParams = sslEngine.getSSLParameters();
           sslParams.setEndpointIdentificationAlgorithm(algorithm);

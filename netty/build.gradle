@@ -33,7 +33,7 @@ dependencies {
             project(':grpc-testing-proto'),
             libraries.conscrypt,
             libraries.netty.transport.epoll
-    testRuntimeOnly libraries.netty.tcnative,
+    /* testRuntimeOnly libraries.netty.tcnative,
             libraries.netty.tcnative.classes
     testRuntimeOnly (libraries.netty.tcnative) {
         artifact {
@@ -59,7 +59,7 @@ dependencies {
         artifact {
             classifier = "windows-x86_64"
         }
-    }
+    }*/
     testRuntimeOnly (libraries.netty.transport.epoll) {
         artifact {
             classifier = "linux-x86_64"
