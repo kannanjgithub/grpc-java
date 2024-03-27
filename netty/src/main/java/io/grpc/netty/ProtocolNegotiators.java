@@ -598,7 +598,7 @@ final class ProtocolNegotiators {
     protected void handlerAdded0(ChannelHandlerContext ctx) {
       SSLEngine sslEngine = sslContext.newEngine(ctx.alloc(), host, port);
       SSLParameters sslParams = sslEngine.getSSLParameters();
-      sslParams.setEndpointIdentificationAlgorithm("HTTPS");
+      sslParams.setEndpointIdentificationAlgorithm(null);
       sslEngine.setSSLParameters(sslParams);
       ctx.pipeline().addBefore(ctx.name(), /* name= */ null, this.executor != null
           ? new SslHandler(sslEngine, false, this.executor)
