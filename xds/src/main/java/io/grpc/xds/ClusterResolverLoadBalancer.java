@@ -617,7 +617,8 @@ final class ClusterResolverLoadBalancer extends LoadBalancer {
               // Arbitrary priority notation for all DNS-resolved endpoints.
               String priorityName = priorityName(name, 0);  // value doesn't matter
               List<EquivalentAddressGroup> addresses = new ArrayList<>();
-              for (EquivalentAddressGroup eag : resolutionResult.getAddresses()) {
+              for (EquivalentAddressGroup eag : resolutionResult.getAddressesOrError()
+                  .getAddresses()) {
                 // No weight attribute is attached, all endpoint-level LB policy should be able
                 // to handle such it.
                 String localityName = localityName(LOGICAL_DNS_CLUSTER_LOCALITY);

@@ -95,7 +95,12 @@ public abstract class NameResolver {
 
           @Override
           public void onResult(ResolutionResult resolutionResult) {
-            listener.onAddresses(resolutionResult.getAddresses(), resolutionResult.getAttributes());
+            if (resolutionResult.getAddressesOrError().getError() != null) {
+              listener.onError(resolutionResult.getAddressesOrError().getError());
+            } else {
+              listener.onAddresses(resolutionResult.getAddressesOrError().getAddresses(),
+                  resolutionResult.getAttributes());
+            }
           }
       });
     }
@@ -217,15 +222,12 @@ public abstract class NameResolver {
      */
     @Override
     @Deprecated
-    @InlineMe(
-        replacement = "this.onResult(ResolutionResult.newBuilder().setAddresses(servers)"
-            + ".setAttributes(attributes).build())",
-        imports = "io.grpc.NameResolver.ResolutionResult")
+    @InlineMe(replacement = "this.onResult(ResolutionResult.newBuilder().setAddressesOrError(new AddressesOrError(servers)).setAttributes(attributes).build())", imports = {"io.grpc.NameResolver.AddressesOrError", "io.grpc.NameResolver.ResolutionResult"})
     public final void onAddresses(
         List<EquivalentAddressGroup> servers, @ResolutionResultAttr Attributes attributes) {
       // TODO(jihuncho) need to promote Listener2 if we want to use ConfigOrError
       onResult(
-          ResolutionResult.newBuilder().setAddresses(servers).setAttributes(attributes).build());
+          ResolutionResult.newBuilder().setAddressesOrError(new AddressesOrError(servers)).setAttributes(attributes).build());
     }
 
     /**
@@ -244,6 +246,7 @@ public abstract class NameResolver {
      * @param error a non-OK status
      * @since 1.21.0
      */
+    @Deprecated
     @Override
     public abstract void onError(Status error);
   }
@@ -573,17 +576,17 @@ public abstract class NameResolver {
    */
   @ExperimentalApi("https://github.com/grpc/grpc-java/issues/1770")
   public static final class ResolutionResult {
-    private final List<EquivalentAddressGroup> addresses;
+    private final AddressesOrError addresses;
     @ResolutionResultAttr
     private final Attributes attributes;
     @Nullable
     private final ConfigOrError serviceConfig;
 
     ResolutionResult(
-        List<EquivalentAddressGroup> addresses,
+        AddressesOrError addresses,
         @ResolutionResultAttr Attributes attributes,
         ConfigOrError serviceConfig) {
-      this.addresses = Collections.unmodifiableList(new ArrayList<>(addresses));
+      this.addresses = addresses;
       this.attributes = checkNotNull(attributes, "attributes");
       this.serviceConfig = serviceConfig;
     }
@@ -604,17 +607,12 @@ public abstract class NameResolver {
      */
     public Builder toBuilder() {
       return newBuilder()
-          .setAddresses(addresses)
+          .setAddressesOrError(addresses)
           .setAttributes(attributes)
           .setServiceConfig(serviceConfig);
     }
 
-    /**
-     * Gets the addresses resolved by name resolution.
-     *
-     * @since 1.21.0
-     */
-    public List<EquivalentAddressGroup> getAddresses() {
+    public AddressesOrError getAddressesOrError() {
       return addresses;
     }
 
@@ -677,7 +675,8 @@ public abstract class NameResolver {
      */
     @ExperimentalApi("https://github.com/grpc/grpc-java/issues/1770")
     public static final class Builder {
-      private List<EquivalentAddressGroup> addresses = Collections.emptyList();
+      @Nullable
+      private AddressesOrError addresses;
       private Attributes attributes = Attributes.EMPTY;
       @Nullable
       private ConfigOrError serviceConfig;
@@ -690,7 +689,22 @@ public abstract class NameResolver {
        *
        * @since 1.21.0
        */
+      @Deprecated
       public Builder setAddresses(List<EquivalentAddressGroup> addresses) {
+        this.addresses = new AddressesOrError(addresses);
+        return this;
+      }
+
+      /**
+       * Sets the error in name resolution.
+       */
+      @Deprecated
+      public Builder setError(Status status) {
+        this.addresses = new AddressesOrError(status);
+        return this;
+      }
+
+      public Builder setAddressesOrError(AddressesOrError addresses) {
         this.addresses = addresses;
         return this;
       }
@@ -812,6 +826,32 @@ public abstract class NameResolver {
             .add("error", status)
             .toString();
       }
+    }
+  }
+
+  @ExperimentalApi("https://github.com/grpc/grpc-java/issues/9999")
+  public static final class AddressesOrError {
+    private final Status status;
+    private final List<EquivalentAddressGroup> addresses;
+    public AddressesOrError(List<EquivalentAddressGroup> addresses) {
+      this.addresses = Collections.unmodifiableList(new ArrayList<>(addresses));
+      this.status = null;
+    }
+
+    public AddressesOrError(Status status) {
+      checkArgument(!status.isOk(), "cannot use OK status: %s", status);
+      this.addresses = null;
+      this.status = status;
+    }
+
+    @Nullable
+    public List<EquivalentAddressGroup> getAddresses() {
+      return addresses;
+    }
+
+    @Nullable
+    public Status getError() {
+      return status;
     }
   }
 }
