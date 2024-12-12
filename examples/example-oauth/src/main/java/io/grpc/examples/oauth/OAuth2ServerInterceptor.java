@@ -18,11 +18,14 @@ package io.grpc.examples.oauth;
 
 import io.grpc.Context;
 import io.grpc.Contexts;
+import io.grpc.ForwardingServerCall.SimpleForwardingServerCall;
 import io.grpc.Metadata;
 import io.grpc.ServerCall;
 import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
 import io.grpc.Status;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * This interceptor gets the OAuth2 access token from metadata, verifies it and sets the client
@@ -54,10 +57,20 @@ class OAuth2ServerInterceptor implements ServerInterceptor {
       } else {
         String[] tokens = tokenValue.split(":");
         if (tokens.length >= 3 && tokens[2].equals(Constant.REFRESH_SUFFIX)) {
+          List<String> tokensList = new ArrayList<>();
+          tokensList.add(tokens[1]);
           // set access tokenValue into current context
           Context ctx = Context.current()
-              .withValue(Constant.CLIENT_ID_CONTEXT_KEY, tokens[1]);
-          return Contexts.interceptCall(ctx, serverCall, metadata, serverCallHandler);
+              .withValue(Constant.CLIENT_ID_CONTEXT_KEY, tokensList);
+          SimpleForwardingServerCall<ReqT, RespT> forwardingCall = new SimpleForwardingServerCall<ReqT, RespT>(
+              serverCall) {
+            @Override
+            public void sendHeaders(Metadata responseHeaders) {
+              String value = Constant.CLIENT_ID_CONTEXT_KEY.get().get(0);
+              super.sendHeaders(responseHeaders);
+            }
+          };
+          return Contexts.interceptCall(ctx,forwardingCall,metadata,serverCallHandler);
         } else {
           status = Status.UNAUTHENTICATED.withDescription("stale credentials");
         }

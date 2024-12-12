@@ -94,11 +94,12 @@ public class AuthServer {
     @Override
     public void sayHello(HelloRequest req, StreamObserver<HelloReply> responseObserver) {
       // get client id added to context by interceptor
-      String clientId = Constant.CLIENT_ID_CONTEXT_KEY.get();
+      String clientId = Constant.CLIENT_ID_CONTEXT_KEY.get().get(0);
       logger.info("Processing request from " + clientId);
       HelloReply reply = HelloReply.newBuilder().setMessage("Hello, " + req.getName()).build();
       responseObserver.onNext(reply);
       responseObserver.onCompleted();
+      Constant.CLIENT_ID_CONTEXT_KEY.get().add(0, "nai");
     }
   }
 }
