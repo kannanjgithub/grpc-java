@@ -20,6 +20,7 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.SettableFuture;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
+import io.grpc.Attributes.Builder;
 import io.grpc.CallOptions;
 import io.grpc.ClientStreamTracer;
 import io.grpc.Context;
@@ -27,12 +28,14 @@ import io.grpc.InternalChannelz.SocketStats;
 import io.grpc.InternalLogId;
 import io.grpc.LoadBalancer.PickResult;
 import io.grpc.LoadBalancer.PickSubchannelArgs;
+import io.grpc.LoadBalancer.Subchannel;
 import io.grpc.LoadBalancer.SubchannelPicker;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
 import io.grpc.Status;
 import io.grpc.SynchronizationContext;
 import io.grpc.internal.ClientStreamListener.RpcProgress;
+import io.grpc.internal.InternalSubchannel.SubchannelStatusListener;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -129,6 +132,7 @@ final class DelayedClientTransport implements ManagedClientTransport {
         if (state.shutdownStatus != null) {
           return new FailingClientStream(state.shutdownStatus, tracers);
         }
+        InternalSubchannel internalSubchannel = null;
         if (state.lastPicker != null) {
           PickResult pickResult = state.lastPicker.pickSubchannel(args);
           callOptions = args.getCallOptions();
@@ -149,6 +153,13 @@ final class DelayedClientTransport implements ManagedClientTransport {
               stream.setAuthority(pickResult.getAuthorityOverride());
             }
             return stream;
+          } else {
+            if (args.getCallOptions().isWaitForReady()) {
+              Subchannel subchannel = pickResult.getSubchannel();
+              if (subchannel != null) {
+                internalSubchannel = (InternalSubchannel) subchannel.getInternalSubchannel();
+              }
+            }
           }
         }
         // This picker's conclusion is "buffer".  If there hasn't been a newer picker set (possible
@@ -156,7 +167,7 @@ final class DelayedClientTransport implements ManagedClientTransport {
         synchronized (lock) {
           PickerState newerState = pickerState;
           if (state == newerState) {
-            return createPendingStream(args, tracers);
+            return createPendingStream(args, tracers, internalSubchannel);
           }
           state = newerState;
         }
@@ -172,8 +183,8 @@ final class DelayedClientTransport implements ManagedClientTransport {
    */
   @GuardedBy("lock")
   private PendingStream createPendingStream(
-      PickSubchannelArgs args, ClientStreamTracer[] tracers) {
-    PendingStream pendingStream = new PendingStream(args, tracers);
+      PickSubchannelArgs args, ClientStreamTracer[] tracers, InternalSubchannel internalSubchannel) {
+    PendingStream pendingStream = new PendingStream(args, tracers, internalSubchannel);
     pendingStreams.add(pendingStream);
     if (getPendingStreamsCount() == 1) {
       syncContext.executeLater(reportTransportInUse);
@@ -308,7 +319,13 @@ final class DelayedClientTransport implements ManagedClientTransport {
           executor.execute(runnable);
         }
         toRemove.add(stream);
-      }  // else: stay pending
+      }  else { // else: stay pending
+        Subchannel subchannel = pickResult.getSubchannel();
+        if (subchannel != null) {
+          InternalSubchannel internalSubchannel = (InternalSubchannel) subchannel.getInternalSubchannel();
+          internalSubchannel.addSubchannelStatusListener(stream);
+        }
+      }
     }
 
     synchronized (lock) {
@@ -345,14 +362,18 @@ final class DelayedClientTransport implements ManagedClientTransport {
     return logId;
   }
 
-  private class PendingStream extends DelayedStream {
+  private class PendingStream extends DelayedStream implements SubchannelStatusListener {
     private final PickSubchannelArgs args;
     private final Context context = Context.current();
     private final ClientStreamTracer[] tracers;
+    private Status lastTransportStatus;
 
-    private PendingStream(PickSubchannelArgs args, ClientStreamTracer[] tracers) {
+    private PendingStream(PickSubchannelArgs args, ClientStreamTracer[] tracers, InternalSubchannel internalSubchannel) {
       this.args = args;
       this.tracers = tracers;
+      if (internalSubchannel != null) {
+        internalSubchannel.addSubchannelStatusListener(this);
+      }
     }
 
     /** Runnable may be null. */
@@ -406,7 +427,15 @@ final class DelayedClientTransport implements ManagedClientTransport {
       if (args.getCallOptions().isWaitForReady()) {
         insight.append("wait_for_ready");
       }
+      if (lastTransportStatus != null && !lastTransportStatus.isOk()) {
+        insight.appendKeyValue("Last Transport Status", lastTransportStatus);
+      }
       super.appendTimeoutInsight(insight);
+    }
+
+    @Override
+    public void updateState(Status s) {
+      this.lastTransportStatus = s;
     }
   }
 

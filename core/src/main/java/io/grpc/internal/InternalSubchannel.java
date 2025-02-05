@@ -81,6 +81,7 @@ final class InternalSubchannel implements InternalInstrumented<ChannelStats>, Tr
   private final boolean reconnectDisabled;
 
   private final List<ClientTransportFilter> transportFilters;
+  private final List<SubchannelStatusListener> subchannelStatusListeners = new ArrayList<>();
 
   /**
    * All field must be mutated in the syncContext.
@@ -160,6 +161,7 @@ final class InternalSubchannel implements InternalInstrumented<ChannelStats>, Tr
   private Status shutdownReason;
 
   private volatile Attributes connectedAddressAttributes;
+  private Status transportStatus;
 
   InternalSubchannel(LoadBalancer.CreateSubchannelArgs args, String authority, String userAgent,
                      BackoffPolicy.Provider backoffPolicyProvider,
@@ -194,8 +196,16 @@ final class InternalSubchannel implements InternalInstrumented<ChannelStats>, Tr
     this.reconnectDisabled = args.getOption(LoadBalancer.DISABLE_SUBCHANNEL_RECONNECT_KEY);
   }
 
+  Status getTransportStatus() {
+    return transportStatus;
+  }
+
   ChannelLogger getChannelLogger() {
     return channelLogger;
+  }
+
+  void addSubchannelStatusListener(SubchannelStatusListener subchannelStatusListener) {
+    subchannelStatusListeners.add(subchannelStatusListener);
   }
 
   @Override
@@ -605,12 +615,16 @@ final class InternalSubchannel implements InternalInstrumented<ChannelStats>, Tr
 
     @Override
     public void transportShutdown(final Status s) {
+      transportStatus = s;
       channelLogger.log(
           ChannelLogLevel.INFO, "{0} SHUTDOWN with {1}", transport.getLogId(), printShortStatus(s));
       shutdownInitiated = true;
       syncContext.execute(new Runnable() {
         @Override
         public void run() {
+          for (SubchannelStatusListener subchannelStatusListener: subchannelStatusListeners) {
+            subchannelStatusListener.updateState(s);
+          }
           if (state.getState() == SHUTDOWN) {
             return;
           }
@@ -658,6 +672,10 @@ final class InternalSubchannel implements InternalInstrumented<ChannelStats>, Tr
         }
       });
     }
+  }
+
+  interface SubchannelStatusListener {
+    void updateState(Status s);
   }
 
   // All methods are called in syncContext
