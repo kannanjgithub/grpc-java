@@ -18,7 +18,12 @@ package io.grpc.examples.helloworld;
 
 import io.grpc.Grpc;
 import io.grpc.InsecureServerCredentials;
+import io.grpc.Metadata;
 import io.grpc.Server;
+import io.grpc.ServerCall;
+import io.grpc.ServerCall.Listener;
+import io.grpc.ServerCallHandler;
+import io.grpc.ServerInterceptor;
 import io.grpc.stub.StreamObserver;
 import java.io.IOException;
 import java.util.concurrent.TimeUnit;
@@ -36,6 +41,39 @@ public class HelloWorldServer {
     /* The port on which the server should run */
     int port = 50051;
     server = Grpc.newServerBuilderForPort(port, InsecureServerCredentials.create())
+        .intercept(new ServerInterceptor() {
+          @Override
+          public <ReqT, RespT> Listener<ReqT> interceptCall(ServerCall<ReqT, RespT> call,
+              Metadata headers, ServerCallHandler<ReqT, RespT> next) {
+            Listener<ReqT> fwkReqListener = next.startCall(call, headers);
+            return new Listener<ReqT>() {
+              @Override
+              public void onMessage(ReqT message) {
+                fwkReqListener.onMessage(message);
+              }
+
+              @Override
+              public void onHalfClose() {
+                fwkReqListener.onHalfClose();
+              }
+
+              @Override
+              public void onCancel() {
+                fwkReqListener.onCancel();
+              }
+
+              @Override
+              public void onComplete() {
+                fwkReqListener.onComplete();
+              }
+
+              @Override
+              public void onReady() {
+                fwkReqListener.onReady();
+              }
+            };
+          }
+        })
         .addService(new GreeterImpl())
         .build()
         .start();
@@ -83,6 +121,11 @@ public class HelloWorldServer {
 
     @Override
     public void sayHello(HelloRequest req, StreamObserver<HelloReply> responseObserver) {
+      try {
+        Thread.sleep(10000);
+      } catch (InterruptedException e) {
+        throw new RuntimeException(e);
+      }
       HelloReply reply = HelloReply.newBuilder().setMessage("Hello " + req.getName()).build();
       responseObserver.onNext(reply);
       responseObserver.onCompleted();

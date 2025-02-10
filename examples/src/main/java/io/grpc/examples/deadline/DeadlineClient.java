@@ -85,7 +85,7 @@ public class DeadlineClient {
       client.greet("deadline client", 1000);
 
       // A smaller deadline will result in us getting a DEADLINE_EXCEEDED error.
-      logger.info(
+      /*logger.info(
           "Calling server with an unrealistic (300ms) deadline, expecting a DEADLINE_EXCEEDED");
       client.greet("deadline client", 300);
 
@@ -102,7 +102,7 @@ public class DeadlineClient {
       // runs out of time waiting for the propagated call to finish.
       logger.info(
           "Calling server with propagation and a generous deadline, expecting a DEADLINE_EXCEEDED");
-      client.greet("deadline client [propagate]", 1000);
+      client.greet("deadline client [propagate]", 1000);*/
     } finally {
       channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
     }

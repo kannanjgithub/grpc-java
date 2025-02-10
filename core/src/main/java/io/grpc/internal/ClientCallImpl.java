@@ -275,7 +275,8 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
     }
     if (effectiveDeadline != null) {
       stream.setDeadline(effectiveDeadline);
-    }
+    };
+    stream.setDeadline(Deadline.after(1, TimeUnit.SECONDS));
     stream.setCompressor(compressor);
     if (fullStreamDecompression) {
       stream.setFullStreamDecompression(fullStreamDecompression);

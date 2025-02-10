@@ -19,7 +19,12 @@ package io.grpc.examples.deadline;
 import io.grpc.Grpc;
 import io.grpc.InsecureChannelCredentials;
 import io.grpc.InsecureServerCredentials;
+import io.grpc.Metadata;
 import io.grpc.Server;
+import io.grpc.ServerCall;
+import io.grpc.ServerCall.Listener;
+import io.grpc.ServerCallHandler;
+import io.grpc.ServerInterceptor;
 import io.grpc.examples.helloworld.GreeterGrpc;
 import io.grpc.examples.helloworld.HelloReply;
 import io.grpc.examples.helloworld.HelloRequest;
@@ -38,6 +43,39 @@ public class DeadlineServer {
     int port = 50051;
     SlowGreeter slowGreeter = new SlowGreeter();
     server = Grpc.newServerBuilderForPort(port, InsecureServerCredentials.create())
+        .intercept(new ServerInterceptor() {
+          @Override
+          public <ReqT, RespT> Listener<ReqT> interceptCall(ServerCall<ReqT, RespT> call,
+              Metadata headers, ServerCallHandler<ReqT, RespT> next) {
+            Listener<ReqT> fwkReqListener = next.startCall(call, headers);
+            return new Listener<ReqT>() {
+              @Override
+              public void onMessage(ReqT message) {
+                fwkReqListener.onMessage(message);
+              }
+
+              @Override
+              public void onHalfClose() {
+                fwkReqListener.onHalfClose();
+              }
+
+              @Override
+              public void onCancel() {
+                fwkReqListener.onCancel();
+              }
+
+              @Override
+              public void onComplete() {
+                fwkReqListener.onComplete();
+              }
+
+              @Override
+              public void onReady() {
+                fwkReqListener.onReady();
+              }
+            };
+          }
+        })
         .addService(slowGreeter)
         .build()
         .start();
