@@ -146,7 +146,7 @@ public abstract class ServerCall<ReqT, RespT> {
    *
    * <p>If {@code false}, {@link Listener#onReady()} will be called after {@code isReady()}
    * transitions to {@code true}.
-   *
+   *[
    * <p>This abstract class's implementation always returns {@code true}. Implementations generally
    * override the method.
    */

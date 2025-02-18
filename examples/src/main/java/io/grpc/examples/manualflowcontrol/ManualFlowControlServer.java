@@ -26,13 +26,29 @@ import java.io.IOException;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
+class MyWorker implements Runnable {
+  StreamObserver<HelloReply> responseObserver;
+  volatile boolean throwed = false;
+  @Override
+  public void run() {
+    while (true) {
+      if (throwed) {
+        responseObserver.onNext(HelloReply.newBuilder().setMessage("nai").build());
+        throwed = false;
+      }
+    }
+  }
+}
 public class ManualFlowControlServer {
   private static final Logger logger =
       Logger.getLogger(ManualFlowControlServer.class.getName());
 
   public static void main(String[] args) throws InterruptedException, IOException {
+    MyWorker myWorker = new MyWorker();
+    new Thread(myWorker).start();
     // Service class implementation
     StreamingGreeterGrpc.StreamingGreeterImplBase svc = new StreamingGreeterGrpc.StreamingGreeterImplBase() {
+
       @Override
       public StreamObserver<HelloRequest> sayHelloStreaming(final StreamObserver<HelloReply> responseObserver) {
         // Set up manual flow control for the request stream. It feels backwards to configure the request
@@ -70,11 +86,18 @@ public class ManualFlowControlServer {
         final OnReadyHandler onReadyHandler = new OnReadyHandler();
         serverCallStreamObserver.setOnReadyHandler(onReadyHandler);
 
+        myWorker.responseObserver = responseObserver;
+
         // Give gRPC a StreamObserver that can observe and process incoming requests.
         return new StreamObserver<HelloRequest>() {
           int cnt = 0;
           @Override
           public void onNext(HelloRequest request) {
+            int i = 9;
+            if (i > 0) {
+              myWorker.throwed = true;
+              throw new RuntimeException();
+            }
             // Process the request and send a response or an error.
             try {
               // Accept and enqueue the request.
