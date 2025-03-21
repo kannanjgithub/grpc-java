@@ -20,11 +20,14 @@ import io.grpc.Grpc;
 import io.grpc.InsecureChannelCredentials;
 import io.grpc.InsecureServerCredentials;
 import io.grpc.Server;
+import io.grpc.ServerInterceptors;
 import io.grpc.examples.helloworld.GreeterGrpc;
 import io.grpc.examples.helloworld.HelloReply;
 import io.grpc.examples.helloworld.HelloRequest;
 import io.grpc.stub.StreamObserver;
 import java.io.IOException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
@@ -38,6 +41,9 @@ public class DeadlineServer {
     int port = 50051;
     SlowGreeter slowGreeter = new SlowGreeter();
     server = Grpc.newServerBuilderForPort(port, InsecureServerCredentials.create())
+        /*.addService(ServerInterceptors.intercept(slowGreeter, new DeadlineServerInterceptor(
+                Executors.newScheduledThreadPool(1))))*/
+        .addStreamTracerFactory(new AbsoluteDeadlineServerStreamTracerFactory())
         .addService(slowGreeter)
         .build()
         .start();

@@ -79,30 +79,10 @@ public class DeadlineClient {
     try {
       DeadlineClient client = new DeadlineClient(channel);
 
-      // The server takes 500ms to process the call, so setting a deadline further in the future we
-      // should get a successful response.
-      logger.info("Calling server with a generous deadline, expected to work");
-      client.greet("deadline client", 1000);
-
       // A smaller deadline will result in us getting a DEADLINE_EXCEEDED error.
       logger.info(
           "Calling server with an unrealistic (300ms) deadline, expecting a DEADLINE_EXCEEDED");
       client.greet("deadline client", 300);
-
-      // Including the "propagate" magic string in the request will cause the server to call itself
-      // to simulate a situation where a server needs to call another server to satisfy the original
-      // request. This will double the time it takes to respond to the client request, but with
-      // an increased deadline we should get a successful response.
-      logger.info("Calling server with propagation and a generous deadline, expected to work");
-      client.greet("deadline client [propagate]", 2000);
-
-      // With this propagated call we reduce the deadline making it impossible for the both the
-      // first server call and the propagated one to succeed. You should see the call fail with
-      // DEADLINE_EXCEEDED, and you should also see DEADLINE_EXCEEDED in the server output as it
-      // runs out of time waiting for the propagated call to finish.
-      logger.info(
-          "Calling server with propagation and a generous deadline, expecting a DEADLINE_EXCEEDED");
-      client.greet("deadline client [propagate]", 1000);
     } finally {
       channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
     }

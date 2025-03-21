@@ -29,6 +29,7 @@ dependencies {
     implementation "io.grpc:grpc-protobuf:${grpcVersion}"
     implementation "io.grpc:grpc-services:${grpcVersion}"
     implementation "io.grpc:grpc-stub:${grpcVersion}"
+    implementation "io.grpc:grpc-core:${grpcVersion}"
     compileOnly "org.apache.tomcat:annotations-api:6.0.53"
 
     // examples/advanced need this for JsonFormat
@@ -45,7 +46,7 @@ dependencies {
 protobuf {
     protoc { artifact = "com.google.protobuf:protoc:${protocVersion}" }
     plugins {
-        grpc { artifact = "io.grpc:protoc-gen-grpc-java:${grpcVersion}" }
+        grpc { artifact = "io.grpc:protoc-gen-grpc-java:1.70.0" }
     }
     generateProtoTasks {
         all()*.plugins { grpc {} }
