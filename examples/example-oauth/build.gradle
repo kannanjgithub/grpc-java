@@ -24,13 +24,19 @@ java {
 def grpcVersion = '1.73.0-SNAPSHOT' // CURRENT_GRPC_VERSION
 def protobufVersion = '3.25.5'
 def protocVersion = protobufVersion
+def openTelemetryVersion = '1.40.0'
+def openTelemetryPrometheusVersion = '1.40.0-alpha'
 
 dependencies {
     implementation "io.grpc:grpc-protobuf:${grpcVersion}"
     implementation "io.grpc:grpc-stub:${grpcVersion}"
     implementation "io.grpc:grpc-auth:${grpcVersion}"
     implementation "com.google.auth:google-auth-library-oauth2-http:1.23.0"
-
+    implementation "io.grpc:grpc-opentelemetry:${grpcVersion}"
+    implementation "io.opentelemetry:opentelemetry-sdk:${openTelemetryVersion}"
+    implementation "io.opentelemetry:opentelemetry-sdk-metrics:${openTelemetryVersion}"
+    implementation "io.opentelemetry:opentelemetry-exporter-logging:${openTelemetryVersion}"
+    implementation "io.opentelemetry:opentelemetry-exporter-prometheus:${openTelemetryPrometheusVersion}"
     compileOnly "org.apache.tomcat:annotations-api:6.0.53"
 
     runtimeOnly "io.grpc:grpc-netty-shaded:${grpcVersion}"
@@ -44,7 +50,7 @@ dependencies {
 protobuf {
     protoc { artifact = "com.google.protobuf:protoc:${protocVersion}" }
     plugins {
-        grpc { artifact = "io.grpc:protoc-gen-grpc-java:${grpcVersion}" }
+        grpc { artifact = "io.grpc:protoc-gen-grpc-java:1.72.0" }
     }
     generateProtoTasks {
         all()*.plugins { grpc {} }
