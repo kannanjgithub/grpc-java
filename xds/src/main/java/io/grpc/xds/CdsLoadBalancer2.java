@@ -144,6 +144,133 @@ final class CdsLoadBalancer2 extends LoadBalancer {
       }
     }
 
+    private void handleClusterDiscovered2() {
+      if (root.isLeaf) {
+        DiscoveryMechanism instance;
+        if (root.result.clusterType() == ClusterType.EDS) {
+          instance = DiscoveryMechanism.forEds(
+                  root.name, root.result.edsServiceName(),
+                  root.result.lrsServerInfo(),
+                  root.result.maxConcurrentRequests(),
+                  root.result.upstreamTlsContext(),
+                  root.result.filterMetadata(),
+                  root.result.outlierDetection());
+        } else {  // logical DNS
+          instance = DiscoveryMechanism.forLogicalDns(
+                  root.name, root.result.dnsHostName(),
+                  root.result.lrsServerInfo(),
+                  root.result.maxConcurrentRequests(),
+                  root.result.upstreamTlsContext(),
+                  root.result.filterMetadata());
+        }
+        // The LB policy config is provided in service_config.proto/JSON format.
+        NameResolver.ConfigOrError configOrError =
+                GracefulSwitchLoadBalancer.parseLoadBalancingPolicyConfig(
+                        Arrays.asList(root.result.lbPolicyConfig()), lbRegistry);
+        if (configOrError.getError() != null) {
+          throw configOrError.getError().augmentDescription("Unable to parse the LB config")
+                  .asRuntimeException();
+        }
+        ClusterResolverConfig config = new ClusterResolverConfig(
+                List.of(instance),
+                configOrError.getConfig(),
+                root.result.isHttp11ProxyAvailable());
+        if (childLb == null) {
+          childLb = lbRegistry.getProvider(CLUSTER_RESOLVER_POLICY_NAME).newLoadBalancer(helper);
+        }
+        childLb.handleResolvedAddresses(
+                resolvedAddresses.toBuilder().setLoadBalancingPolicyConfig(config).build());
+      } else {
+        int numLeafClusters = 0;
+        // Used for loop detection to break the infinite recursion that loops would cause
+        Map<ClusterState, List<ClusterState>> parentClusters = new HashMap<>();
+        Status loopStatus = null;
+
+        // Level-order traversal.
+        // Collect configurations for all non-aggregate (leaf) clusters.
+        Queue<ClusterState> queue = new ArrayDeque<>();
+        queue.add(root);
+        while (!queue.isEmpty()) {
+          int size = queue.size();
+          for (int i = 0; i < size; i++) {
+            ClusterState clusterState = queue.remove();
+            if (!clusterState.discovered) {
+              return;  // do not proceed until all clusters discovered
+            }
+            if (clusterState.result == null) {  // resource revoked or not exists
+              continue;
+            }
+            if (clusterState.isLeaf) {
+              if (clusterState.childClusterStates == null) {
+                continue;
+              }
+              // Do loop detection and break recursion if detected
+              List<String> namesCausingLoops = identifyLoops(clusterState, parentClusters);
+              if (namesCausingLoops.isEmpty()) {
+                queue.addAll(clusterState.childClusterStates.values());
+              } else {
+                // Do cleanup
+                if (childLb != null) {
+                  childLb.shutdown();
+                  childLb = null;
+                }
+                if (loopStatus != null) {
+                  logger.log(XdsLogLevel.WARNING,
+                          "Multiple loops in CDS config.  Old msg:  " + loopStatus.getDescription());
+                }
+                loopStatus = Status.UNAVAILABLE.withDescription(String.format(
+                        "CDS error: circular aggregate clusters directly under %s for "
+                                + "root cluster %s, named %s, xDS node ID: %s",
+                        clusterState.name, root.name, namesCausingLoops,
+                        xdsClient.getBootstrapInfo().node().getId()));
+              }
+            }
+          }
+        }
+
+        if (loopStatus != null) {
+          helper.updateBalancingState(
+                  TRANSIENT_FAILURE, new FixedResultPicker(PickResult.withError(loopStatus)));
+          return;
+        }
+
+        if (instances.isEmpty()) {  // none of non-aggregate clusters exists
+          if (childLb != null) {
+            childLb.shutdown();
+            childLb = null;
+          }
+          Status unavailable = Status.UNAVAILABLE.withDescription(String.format(
+                  "CDS error: found 0 leaf (logical DNS or EDS) clusters for root cluster %s"
+                          + " xDS node ID: %s", root.name, xdsClient.getBootstrapInfo().node().getId()));
+          helper.updateBalancingState(
+                  TRANSIENT_FAILURE, new FixedResultPicker(PickResult.withError(unavailable)));
+          return;
+        }
+
+        // The LB policy config is provided in service_config.proto/JSON format.
+        NameResolver.ConfigOrError configOrError =
+                GracefulSwitchLoadBalancer.parseLoadBalancingPolicyConfig(
+                        Arrays.asList(root.result.lbPolicyConfig()), lbRegistry);
+        if (configOrError.getError() != null) {
+          throw configOrError.getError().augmentDescription("Unable to parse the LB config")
+                  .asRuntimeException();
+        }
+
+        ClusterResolverConfig config = new ClusterResolverConfig(
+                Collections.unmodifiableList(instances),
+                configOrError.getConfig(),
+                root.result.isHttp11ProxyAvailable());
+        if (childLb == null) {
+          childLb = lbRegistry.getProvider(CLUSTER_RESOLVER_POLICY_NAME).newLoadBalancer(helper);
+        }
+        childLb.handleResolvedAddresses(
+                resolvedAddresses.toBuilder().setLoadBalancingPolicyConfig(config).build());
+        for (String childClusterName: root.result.prioritizedClusterNames()) {
+          
+        }
+      }
+    }
+
     private void handleClusterDiscovered() {
       List<DiscoveryMechanism> instances = new ArrayList<>();
 
