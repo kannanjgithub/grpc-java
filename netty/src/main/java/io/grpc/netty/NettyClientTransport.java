@@ -16,54 +16,6 @@
 
 package io.grpc.netty;
 
-import static io.grpc.internal.GrpcUtil.KEEPALIVE_TIME_NANOS_DISABLED;
-import static io.netty.channel.ChannelOption.ALLOCATOR;
-import static io.netty.channel.ChannelOption.SO_KEEPALIVE;
-
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.MoreObjects;
-import com.google.common.base.Preconditions;
-import com.google.common.base.Ticker;
-import com.google.common.util.concurrent.ListenableFuture;
-import com.google.common.util.concurrent.SettableFuture;
-import io.grpc.Attributes;
-import io.grpc.CallOptions;
-import io.grpc.ChannelLogger;
-import io.grpc.ClientStreamTracer;
-import io.grpc.InternalChannelz.SocketStats;
-import io.grpc.InternalLogId;
-import io.grpc.Metadata;
-import io.grpc.MethodDescriptor;
-import io.grpc.Status;
-import io.grpc.internal.ClientStream;
-import io.grpc.internal.ConnectionClientTransport;
-import io.grpc.internal.FailingClientStream;
-import io.grpc.internal.GrpcUtil;
-import io.grpc.internal.Http2Ping;
-import io.grpc.internal.KeepAliveManager;
-import io.grpc.internal.KeepAliveManager.ClientKeepAlivePinger;
-import io.grpc.internal.StatsTraceContext;
-import io.grpc.internal.TransportTracer;
-import io.grpc.netty.NettyChannelBuilder.LocalSocketPicker;
-import io.netty.bootstrap.Bootstrap;
-import io.netty.channel.Channel;
-import io.netty.channel.ChannelFactory;
-import io.netty.channel.ChannelFuture;
-import io.netty.channel.ChannelFutureListener;
-import io.netty.channel.ChannelHandler;
-import io.netty.channel.ChannelOption;
-import io.netty.channel.EventLoop;
-import io.netty.channel.EventLoopGroup;
-import io.netty.handler.codec.http2.StreamBufferingEncoder.Http2ChannelClosedException;
-import io.netty.util.AsciiString;
-import io.netty.util.concurrent.Future;
-import io.netty.util.concurrent.GenericFutureListener;
-import java.net.SocketAddress;
-import java.nio.channels.ClosedChannelException;
-import java.util.Map;
-import java.util.concurrent.Executor;
-import java.util.concurrent.TimeUnit;
-import javax.annotation.Nullable;
 
 /**
  * A Netty-based {@link ConnectionClientTransport} implementation.
