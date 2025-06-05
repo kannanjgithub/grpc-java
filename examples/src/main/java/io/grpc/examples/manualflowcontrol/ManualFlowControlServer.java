@@ -18,7 +18,9 @@ package io.grpc.examples.manualflowcontrol;
 
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
+import io.grpc.ServerInterceptors;
 import io.grpc.Status;
+import io.grpc.examples.header.HeaderServerInterceptor;
 import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
 
@@ -76,15 +78,21 @@ public class ManualFlowControlServer {
           @Override
           public void onNext(HelloRequest request) {
             // Process the request and send a response or an error.
-            try {
+
               // Accept and enqueue the request.
               String name = request.getName();
               logger.info("--> " + name);
 
               // Simulate server "work"
               int sleepMillis = ++cnt % 20 == 0 ? 2000 : 100;
-              Thread.sleep(sleepMillis);
-
+              try {
+                Thread.sleep(sleepMillis);
+              } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+              }
+              if (cnt > 1) {
+                throw new ArithmeticException("arith");
+              }
               // Send a response.
               String message = "Hello " + name;
               logger.info("<-- " + message);
@@ -106,11 +114,6 @@ public class ManualFlowControlServer {
                 // If not, note that back-pressure has begun.
                 onReadyHandler.wasReady = false;
               }
-            } catch (Throwable throwable) {
-              throwable.printStackTrace();
-              responseObserver.onError(
-                  Status.UNKNOWN.withDescription("Error handling request").withCause(throwable).asException());
-            }
           }
 
           @Override
@@ -132,7 +135,7 @@ public class ManualFlowControlServer {
 
     final Server server = ServerBuilder
         .forPort(50051)
-        .addService(svc)
+        .addService(ServerInterceptors.intercept(svc, new HeaderServerInterceptor()))
         .build()
         .start();
 

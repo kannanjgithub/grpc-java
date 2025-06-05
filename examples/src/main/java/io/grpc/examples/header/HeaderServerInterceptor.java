@@ -17,6 +17,7 @@
 package io.grpc.examples.header;
 
 import com.google.common.annotations.VisibleForTesting;
+import io.grpc.ForwardingServerCall;
 import io.grpc.ForwardingServerCall.SimpleForwardingServerCall;
 import io.grpc.Metadata;
 import io.grpc.ServerCall;
@@ -42,12 +43,39 @@ public class HeaderServerInterceptor implements ServerInterceptor {
       final Metadata requestHeaders,
       ServerCallHandler<ReqT, RespT> next) {
     logger.info("header received from client:" + requestHeaders);
-    return next.startCall(new SimpleForwardingServerCall<ReqT, RespT>(call) {
+    ServerCall.Listener<ReqT> serverCallListener = next.startCall(new SimpleForwardingServerCall<ReqT, RespT>(call) {
       @Override
       public void sendHeaders(Metadata responseHeaders) {
         responseHeaders.put(CUSTOM_HEADER_KEY, "customRespondValue");
         super.sendHeaders(responseHeaders);
       }
     }, requestHeaders);
+
+    return new ServerCall.Listener<ReqT>() {
+      @Override
+      public void onMessage(ReqT message) {
+        serverCallListener.onMessage(message);
+      }
+
+      @Override
+      public void onComplete() {
+        serverCallListener.onComplete();
+      }
+
+      @Override
+      public void onCancel() {
+        serverCallListener.onCancel();
+      }
+
+      @Override
+      public void onHalfClose() {
+        serverCallListener.onHalfClose();
+      }
+
+      @Override
+      public void onReady() {
+        serverCallListener.onReady();
+      }
+    };
   }
 }
