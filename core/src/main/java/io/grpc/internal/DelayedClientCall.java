@@ -300,7 +300,6 @@ public class DelayedClientCall<ReqT, RespT> extends ClientCall<ReqT, RespT> {
       }
       for (Runnable runnable : toRun) {
         // Must not call transport while lock is held to prevent deadlocks.
-        // TODO(ejona): exception handling
         runnable.run();
       }
       toRun.clear();

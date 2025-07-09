@@ -164,6 +164,35 @@ public class ClientCallsTest {
   }
 
   @Test
+  public void unaryBlockingCallFailed_outboundMessageSizeExceeded() throws Exception {
+    Integer req = 2;
+    final Integer resp = 3;
+
+    class BasicUnaryResponse implements UnaryMethod<Integer, Integer> {
+      Integer request;
+
+      @Override public void invoke(Integer request, StreamObserver<Integer> responseObserver) {
+        this.request = request;
+        responseObserver.onNext(resp);
+        responseObserver.onCompleted();
+      }
+    }
+    BasicUnaryResponse service = new BasicUnaryResponse();
+    server = InProcessServerBuilder.forName("simple-reply").directExecutor()
+        .addService(ServerServiceDefinition.builder("some")
+            .addMethod(UNARY_METHOD, ServerCalls.asyncUnaryCall(service))
+            .build())
+        .build().start();
+    channel = InProcessChannelBuilder.forName("simple-reply").directExecutor().build();
+    try {
+      ClientCalls.blockingUnaryCall(channel, UNARY_METHOD, CallOptions.DEFAULT.withMaxOutboundMessageSize(0), req);
+      fail("Should fail");
+    } catch (StatusRuntimeException e) {
+      System.out.println("err");
+    }
+  }
+
+  @Test
   public void blockingUnaryCall2_success() throws Exception {
     Integer req = 2;
     final Integer resp = 3;
