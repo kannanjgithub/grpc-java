@@ -35,6 +35,7 @@ import io.grpc.xds.EnvoyServerProtoData.UpstreamTlsContext;
 import io.grpc.xds.client.Bootstrapper;
 import io.grpc.xds.client.CommonBootstrapperTestUtils;
 import io.grpc.xds.internal.security.ReferenceCountingMap.ValueFactory;
+import java.util.AbstractMap;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -49,7 +50,9 @@ public class TlsContextManagerTest {
 
   @Rule public final MockitoRule mockitoRule = MockitoJUnit.rule();
 
-  @Mock ValueFactory<UpstreamTlsContext, SslContextProvider> mockClientFactory;
+  private static final String SNI = "sni";
+
+  @Mock ValueFactory<AbstractMap.SimpleImmutableEntry<UpstreamTlsContext, String>, SslContextProvider> mockClientFactory;
 
   @Mock ValueFactory<DownstreamTlsContext, SslContextProvider> mockServerFactory;
 
@@ -79,15 +82,15 @@ public class TlsContextManagerTest {
             CA_PEM_FILE, null, null, null, null, null);
     UpstreamTlsContext upstreamTlsContext =
         CommonTlsContextTestsUtil
-            .buildUpstreamTlsContext("google_cloud_private_spiffe-client", false);
+            .buildUpstreamTlsContext("google_cloud_private_spiffe-client", false, null, false);
 
     TlsContextManagerImpl tlsContextManagerImpl = new TlsContextManagerImpl(bootstrapInfoForClient);
     SslContextProvider clientSecretProvider =
-        tlsContextManagerImpl.findOrCreateClientSslContextProvider(upstreamTlsContext);
+        tlsContextManagerImpl.findOrCreateClientSslContextProvider(upstreamTlsContext, SNI);
     assertThat(clientSecretProvider).isNotNull();
 
     SslContextProvider clientSecretProvider1 =
-        tlsContextManagerImpl.findOrCreateClientSslContextProvider(upstreamTlsContext);
+        tlsContextManagerImpl.findOrCreateClientSslContextProvider(upstreamTlsContext, SNI);
     assertThat(clientSecretProvider1).isSameInstanceAs(clientSecretProvider);
   }
 
@@ -123,18 +126,18 @@ public class TlsContextManagerTest {
             CA_PEM_FILE, "cert-instance-2", CLIENT_KEY_FILE, CLIENT_PEM_FILE, CA_PEM_FILE, null);
     UpstreamTlsContext upstreamTlsContext =
         CommonTlsContextTestsUtil
-            .buildUpstreamTlsContext("google_cloud_private_spiffe-client", false);
+            .buildUpstreamTlsContext("google_cloud_private_spiffe-client", false, null, false);
 
     TlsContextManagerImpl tlsContextManagerImpl = new TlsContextManagerImpl(bootstrapInfoForClient);
     SslContextProvider clientSecretProvider =
-        tlsContextManagerImpl.findOrCreateClientSslContextProvider(upstreamTlsContext);
+        tlsContextManagerImpl.findOrCreateClientSslContextProvider(upstreamTlsContext, SNI);
     assertThat(clientSecretProvider).isNotNull();
 
     UpstreamTlsContext upstreamTlsContext1 =
-        CommonTlsContextTestsUtil.buildUpstreamTlsContext("cert-instance-2", true);
+        CommonTlsContextTestsUtil.buildUpstreamTlsContext("cert-instance-2", true, null, false);
 
     SslContextProvider clientSecretProvider1 =
-        tlsContextManagerImpl.findOrCreateClientSslContextProvider(upstreamTlsContext1);
+        tlsContextManagerImpl.findOrCreateClientSslContextProvider(upstreamTlsContext1, SNI);
     assertThat(clientSecretProvider1).isNotSameInstanceAs(clientSecretProvider);
   }
 
@@ -161,18 +164,19 @@ public class TlsContextManagerTest {
   public void createClientSslContextProvider_releaseInstance() {
     UpstreamTlsContext upstreamTlsContext =
         CommonTlsContextTestsUtil
-            .buildUpstreamTlsContext("google_cloud_private_spiffe-client", true);
+            .buildUpstreamTlsContext("google_cloud_private_spiffe-client", true, null, false);
 
     TlsContextManagerImpl tlsContextManagerImpl =
         new TlsContextManagerImpl(mockClientFactory, mockServerFactory);
     SslContextProvider mockProvider = mock(SslContextProvider.class);
-    when(mockClientFactory.create(upstreamTlsContext)).thenReturn(mockProvider);
+    when(mockClientFactory.create(new AbstractMap.SimpleImmutableEntry(upstreamTlsContext, SNI)))
+        .thenReturn(mockProvider);
     SslContextProvider clientSecretProvider =
-        tlsContextManagerImpl.findOrCreateClientSslContextProvider(upstreamTlsContext);
+        tlsContextManagerImpl.findOrCreateClientSslContextProvider(upstreamTlsContext, SNI);
     assertThat(clientSecretProvider).isSameInstanceAs(mockProvider);
     verify(mockProvider, never()).close();
     when(mockProvider.getUpstreamTlsContext()).thenReturn(upstreamTlsContext);
-    tlsContextManagerImpl.releaseClientSslContextProvider(mockProvider);
+    tlsContextManagerImpl.releaseClientSslContextProvider(mockProvider, SNI);
     verify(mockProvider, times(1)).close();
   }
 }

@@ -85,6 +85,7 @@ import io.grpc.xds.client.Locality;
 import io.grpc.xds.client.XdsClient;
 import io.grpc.xds.client.XdsResourceType;
 import io.grpc.xds.internal.security.CommonTlsContextTestsUtil;
+import io.grpc.xds.internal.security.SecurityProtocolNegotiators;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.net.URI;
@@ -134,7 +135,7 @@ public class ClusterResolverLoadBalancerTest {
   private final Locality locality3 =
       Locality.create("test-region-3", "test-zone-3", "test-subzone-3");
   private final UpstreamTlsContext tlsContext =
-      CommonTlsContextTestsUtil.buildUpstreamTlsContext("google_cloud_private_spiffe", true);
+      CommonTlsContextTestsUtil.buildUpstreamTlsContext("google_cloud_private_spiffe", true, null, false);
   private final OutlierDetection outlierDetection = OutlierDetection.create(
       100L, 100L, 100L, 100, SuccessRateEjection.create(100, 100, 100, 100),
       FailurePercentageEjection.create(100, 100, 100, 100));
@@ -379,7 +380,7 @@ public class ClusterResolverLoadBalancerTest {
 
     assertThat(
         childBalancer.addresses.get(0).getAttributes()
-            .get(XdsAttributes.ATTR_ADDRESS_NAME)).isEqualTo("hostname1");
+            .get(SecurityProtocolNegotiators.ATTR_ADDRESS_NAME)).isEqualTo("hostname1");
   }
 
   @Test
@@ -832,9 +833,9 @@ public class ClusterResolverLoadBalancerTest {
         Collections.<DropOverload>emptyList(), "pick_first");
     assertAddressesEqual(Arrays.asList(endpoint1, endpoint2), childBalancer.addresses);
     assertThat(childBalancer.addresses.get(0).getAttributes()
-        .get(XdsAttributes.ATTR_ADDRESS_NAME)).isEqualTo(DNS_HOST_NAME);
+        .get(SecurityProtocolNegotiators.ATTR_ADDRESS_NAME)).isEqualTo(DNS_HOST_NAME);
     assertThat(childBalancer.addresses.get(1).getAttributes()
-        .get(XdsAttributes.ATTR_ADDRESS_NAME)).isEqualTo(DNS_HOST_NAME);
+        .get(SecurityProtocolNegotiators.ATTR_ADDRESS_NAME)).isEqualTo(DNS_HOST_NAME);
   }
 
   @Test

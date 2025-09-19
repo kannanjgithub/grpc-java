@@ -516,7 +516,7 @@ final class XdsNameResolver extends NameResolver {
           Result.newBuilder()
               .setConfig(config)
               .setInterceptor(combineInterceptors(
-                  ImmutableList.of(filters, new ClusterSelectionInterceptor())))
+                  ImmutableList.of(new ClusterSelectionInterceptor(), filters)))
               .build();
     }
 

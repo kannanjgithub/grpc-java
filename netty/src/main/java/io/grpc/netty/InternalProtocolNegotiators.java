@@ -25,6 +25,8 @@ import io.grpc.netty.ProtocolNegotiators.WaitUntilActiveHandler;
 import io.netty.channel.ChannelHandler;
 import io.netty.handler.ssl.SslContext;
 import io.netty.util.AsciiString;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 import java.util.concurrent.Executor;
 
 /**
@@ -38,13 +40,18 @@ public final class InternalProtocolNegotiators {
    * Returns a {@link ProtocolNegotiator} that ensures the pipeline is set up so that TLS will
    * be negotiated, the {@code handler} is added and writes to the {@link io.netty.channel.Channel}
    * may happen immediately, even before the TLS Handshake is complete.
-   * @param executorPool a dedicated {@link Executor} pool for time-consuming TLS tasks
+   *
+   * @param executorPool             a dedicated {@link Executor} pool for time-consuming TLS tasks
    */
   public static InternalProtocolNegotiator.ProtocolNegotiator tls(SslContext sslContext,
           ObjectPool<? extends Executor> executorPool,
-          Optional<Runnable> handshakeCompleteRunnable) {
+          Optional<Runnable> handshakeCompleteRunnable,
+          TrustManager extendedX509TrustManager,
+          String sni,
+          boolean isXdsTarget) {
     final io.grpc.netty.ProtocolNegotiator negotiator = ProtocolNegotiators.tls(sslContext,
-        executorPool, handshakeCompleteRunnable, null);
+        executorPool, handshakeCompleteRunnable, (X509TrustManager) extendedX509TrustManager, sni,
+        isXdsTarget);
     final class TlsNegotiator implements InternalProtocolNegotiator.ProtocolNegotiator {
 
       @Override
@@ -62,17 +69,18 @@ public final class InternalProtocolNegotiators {
         negotiator.close();
       }
     }
-    
+
     return new TlsNegotiator();
   }
-  
+
   /**
    * Returns a {@link ProtocolNegotiator} that ensures the pipeline is set up so that TLS will
    * be negotiated, the {@code handler} is added and writes to the {@link io.netty.channel.Channel}
    * may happen immediately, even before the TLS Handshake is complete.
    */
-  public static InternalProtocolNegotiator.ProtocolNegotiator tls(SslContext sslContext) {
-    return tls(sslContext, null, Optional.absent());
+  public static InternalProtocolNegotiator.ProtocolNegotiator tls(
+      SslContext sslContext, String sni, boolean isXdsTarget, TrustManager extendedX509TrustManager) {
+    return tls(sslContext, null, Optional.absent(), extendedX509TrustManager, sni, isXdsTarget);
   }
 
   /**
@@ -177,7 +185,7 @@ public final class InternalProtocolNegotiators {
       extends ProtocolNegotiators.ProtocolNegotiationHandler {
 
     protected ProtocolNegotiationHandler(ChannelHandler next, String negotiatorName,
-        ChannelLogger negotiationLogger) {
+       ChannelLogger negotiationLogger) {
       super(next, negotiatorName, negotiationLogger);
     }
 

@@ -811,10 +811,10 @@ public class ClusterImplLoadBalancerTest {
               new FixedResultPicker(PickResult.withSubchannel(subchannel)));
         }
       });
-      assertThat(subchannel.getAttributes().get(XdsAttributes.ATTR_ADDRESS_NAME)).isEqualTo(
+      assertThat(subchannel.getAttributes().get(SecurityProtocolNegotiators.ATTR_ADDRESS_NAME)).isEqualTo(
           "authority-host-name");
       for (EquivalentAddressGroup eag : subchannel.getAllAddresses()) {
-        assertThat(eag.getAttributes().get(XdsAttributes.ATTR_ADDRESS_NAME))
+        assertThat(eag.getAttributes().get(SecurityProtocolNegotiators.ATTR_ADDRESS_NAME))
             .isEqualTo("authority-host-name");
       }
 
@@ -863,9 +863,9 @@ public class ClusterImplLoadBalancerTest {
       }
     });
     // Sub Channel wrapper args won't have the address name although addresses will.
-    assertThat(subchannel.getAttributes().get(XdsAttributes.ATTR_ADDRESS_NAME)).isNull();
+    assertThat(subchannel.getAttributes().get(SecurityProtocolNegotiators.ATTR_ADDRESS_NAME)).isNull();
     for (EquivalentAddressGroup eag : subchannel.getAllAddresses()) {
-      assertThat(eag.getAttributes().get(XdsAttributes.ATTR_ADDRESS_NAME))
+      assertThat(eag.getAttributes().get(SecurityProtocolNegotiators.ATTR_ADDRESS_NAME))
           .isEqualTo("authority-host-name");
     }
 
@@ -881,7 +881,7 @@ public class ClusterImplLoadBalancerTest {
   @Test
   public void endpointAddressesAttachedWithTlsConfig_securityEnabledByDefault() {
     UpstreamTlsContext upstreamTlsContext =
-        CommonTlsContextTestsUtil.buildUpstreamTlsContext("google_cloud_private_spiffe", true);
+        CommonTlsContextTestsUtil.buildUpstreamTlsContext("google_cloud_private_spiffe", true, null, false);
     LoadBalancerProvider weightedTargetProvider = new WeightedTargetLoadBalancerProvider();
     WeightedTargetConfig weightedTargetConfig =
         buildWeightedTargetConfig(ImmutableMap.of(locality, 10));
@@ -926,7 +926,7 @@ public class ClusterImplLoadBalancerTest {
 
     // Config with a new UpstreamTlsContext.
     upstreamTlsContext =
-        CommonTlsContextTestsUtil.buildUpstreamTlsContext("google_cloud_private_spiffe1", true);
+        CommonTlsContextTestsUtil.buildUpstreamTlsContext("google_cloud_private_spiffe1", true, null, false);
     config = new ClusterImplConfig(CLUSTER, EDS_SERVICE_NAME, LRS_SERVER_INFO,
         null, Collections.<DropOverload>emptyList(),
         GracefulSwitchLoadBalancer.createLoadBalancingPolicyConfig(
@@ -1019,7 +1019,7 @@ public class ClusterImplLoadBalancerTest {
         // Unique but arbitrary string
         .set(XdsAttributes.ATTR_LOCALITY_NAME, locality.toString());
     if (authorityHostname != null) {
-      attributes.set(XdsAttributes.ATTR_ADDRESS_NAME, authorityHostname);
+      attributes.set(SecurityProtocolNegotiators.ATTR_ADDRESS_NAME, authorityHostname);
     }
     EquivalentAddressGroup eag = new EquivalentAddressGroup(new FakeSocketAddress(name),
         attributes.build());
@@ -1259,7 +1259,7 @@ public class ClusterImplLoadBalancerTest {
   private static final class FakeTlsContextManager implements TlsContextManager {
     @Override
     public SslContextProvider findOrCreateClientSslContextProvider(
-        UpstreamTlsContext upstreamTlsContext) {
+        UpstreamTlsContext upstreamTlsContext, String sni) {
       SslContextProvider sslContextProvider = mock(SslContextProvider.class);
       when(sslContextProvider.getUpstreamTlsContext()).thenReturn(upstreamTlsContext);
       return sslContextProvider;
@@ -1267,7 +1267,7 @@ public class ClusterImplLoadBalancerTest {
 
     @Override
     public SslContextProvider releaseClientSslContextProvider(
-        SslContextProvider sslContextProvider) {
+        SslContextProvider sslContextProvider, String sni) {
       // no-op
       return null;
     }

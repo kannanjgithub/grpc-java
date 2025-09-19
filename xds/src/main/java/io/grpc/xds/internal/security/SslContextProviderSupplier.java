@@ -16,8 +16,6 @@
 
 package io.grpc.xds.internal.security;
 
-import static com.google.common.base.Preconditions.checkNotNull;
-
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.MoreObjects;
 import io.grpc.xds.EnvoyServerProtoData.BaseTlsContext;
@@ -25,7 +23,14 @@ import io.grpc.xds.EnvoyServerProtoData.DownstreamTlsContext;
 import io.grpc.xds.EnvoyServerProtoData.UpstreamTlsContext;
 import io.grpc.xds.TlsContextManager;
 import io.netty.handler.ssl.SslContext;
+
+import javax.net.ssl.TrustManager;
+import java.util.AbstractMap;
+import java.util.HashSet;
 import java.util.Objects;
+import java.util.Set;
+
+import static com.google.common.base.Preconditions.checkNotNull;
 
 /**
  * Enables Client or server side to initialize this object with the received {@link BaseTlsContext}
@@ -38,6 +43,7 @@ public final class SslContextProviderSupplier implements Closeable {
 
   private final BaseTlsContext tlsContext;
   private final TlsContextManager tlsContextManager;
+  private final Set<String> snisSentByClients = new HashSet<>();
   private SslContextProvider sslContextProvider;
   private boolean shutdown;
 
@@ -52,31 +58,32 @@ public final class SslContextProviderSupplier implements Closeable {
   }
 
   /** Updates SslContext via the passed callback. */
-  public synchronized void updateSslContext(final SslContextProvider.Callback callback) {
+  public synchronized void updateSslContext(final SslContextProvider.Callback callback, String sni) {
     checkNotNull(callback, "callback");
     try {
       if (!shutdown) {
         if (sslContextProvider == null) {
-          sslContextProvider = getSslContextProvider();
+          sslContextProvider = getSslContextProvider(sni);
         }
       }
       // we want to increment the ref-count so call findOrCreate again...
-      final SslContextProvider toRelease = getSslContextProvider();
+      final SslContextProvider toRelease = getSslContextProvider(sni);
       toRelease.addCallback(
           new SslContextProvider.Callback(callback.getExecutor()) {
 
-            @Override
-            public void updateSslContext(SslContext sslContext) {
-              callback.updateSslContext(sslContext);
-              releaseSslContextProvider(toRelease);
-            }
+          @Override
+          public void updateSslContextAndExtendedX509TrustManager(
+              AbstractMap.SimpleImmutableEntry<SslContext, TrustManager> sslContextAndTm) {
+            callback.updateSslContextAndExtendedX509TrustManager(sslContextAndTm);
+            releaseSslContextProvider(toRelease, sni);
+          }
 
-            @Override
-            public void onException(Throwable throwable) {
-              callback.onException(throwable);
-              releaseSslContextProvider(toRelease);
-            }
-          });
+          @Override
+          public void onException(Throwable throwable) {
+            callback.onException(throwable);
+            releaseSslContextProvider(toRelease, sni);
+          }
+        });
     } catch (final Throwable throwable) {
       callback.getExecutor().execute(new Runnable() {
         @Override
@@ -87,18 +94,21 @@ public final class SslContextProviderSupplier implements Closeable {
     }
   }
 
-  private void releaseSslContextProvider(SslContextProvider toRelease) {
+  private void releaseSslContextProvider(SslContextProvider toRelease, String sni) {
     if (tlsContext instanceof UpstreamTlsContext) {
-      tlsContextManager.releaseClientSslContextProvider(toRelease);
+      tlsContextManager.releaseClientSslContextProvider(toRelease, sni);
+      snisSentByClients.remove(sni);
     } else {
       tlsContextManager.releaseServerSslContextProvider(toRelease);
     }
   }
 
-  private SslContextProvider getSslContextProvider() {
-    return tlsContext instanceof UpstreamTlsContext
-        ? tlsContextManager.findOrCreateClientSslContextProvider((UpstreamTlsContext) tlsContext)
-        : tlsContextManager.findOrCreateServerSslContextProvider((DownstreamTlsContext) tlsContext);
+  private SslContextProvider getSslContextProvider(String sni) {
+    if (tlsContext instanceof UpstreamTlsContext) {
+      snisSentByClients.add(sni);
+      return tlsContextManager.findOrCreateClientSslContextProvider((UpstreamTlsContext) tlsContext, sni);
+    }
+    return tlsContextManager.findOrCreateServerSslContextProvider((DownstreamTlsContext) tlsContext);
   }
 
   @VisibleForTesting public boolean isShutdown() {
@@ -110,7 +120,9 @@ public final class SslContextProviderSupplier implements Closeable {
   public synchronized void close() {
     if (sslContextProvider != null) {
       if (tlsContext instanceof UpstreamTlsContext) {
-        tlsContextManager.releaseClientSslContextProvider(sslContextProvider);
+        for (String sni: snisSentByClients) {
+          tlsContextManager.releaseClientSslContextProvider(sslContextProvider, sni);
+        }
       } else {
         tlsContextManager.releaseServerSslContextProvider(sslContextProvider);
       }
