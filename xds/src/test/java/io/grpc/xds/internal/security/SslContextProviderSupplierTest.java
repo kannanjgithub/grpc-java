@@ -78,6 +78,7 @@ public class SslContextProviderSupplierTest {
   }
 
   @Test
+  @SuppressWarnings("unchecked")
   public void get_updateSecret() {
     prepareSupplier(true);
     callUpdateSslContext();
@@ -91,8 +92,7 @@ public class SslContextProviderSupplierTest {
     SslContextProvider.Callback capturedCallback = callbackCaptor.getValue();
     assertThat(capturedCallback).isNotNull();
     AbstractMap.SimpleImmutableEntry<SslContext, TrustManager> mockSslContextAndTm =
-        (AbstractMap.SimpleImmutableEntry<SslContext, TrustManager>)
-            mock(AbstractMap.SimpleImmutableEntry.class);
+        mock(AbstractMap.SimpleImmutableEntry.class);
     capturedCallback.updateSslContextAndExtendedX509TrustManager(mockSslContextAndTm);
     verify(mockCallback, times(1)).updateSslContextAndExtendedX509TrustManager(eq(mockSslContextAndTm));
     verify(mockTlsContextManager, times(1))
@@ -104,6 +104,7 @@ public class SslContextProviderSupplierTest {
   }
 
   @Test
+  @SuppressWarnings("unchecked")
   public void autoHostSniFalse_usesSniFromUpstreamTlsContext() {
     prepareSupplier(true);
     callUpdateSslContext();
@@ -117,8 +118,7 @@ public class SslContextProviderSupplierTest {
     SslContextProvider.Callback capturedCallback = callbackCaptor.getValue();
     assertThat(capturedCallback).isNotNull();
     AbstractMap.SimpleImmutableEntry<SslContext, TrustManager> mockSslContextAndTm =
-        (AbstractMap.SimpleImmutableEntry<SslContext, TrustManager>)
-            mock(AbstractMap.SimpleImmutableEntry.class);
+        mock(AbstractMap.SimpleImmutableEntry.class);
     capturedCallback.updateSslContextAndExtendedX509TrustManager(mockSslContextAndTm);
     verify(mockCallback, times(1))
         .updateSslContextAndExtendedX509TrustManager(eq(mockSslContextAndTm));
@@ -148,6 +148,7 @@ public class SslContextProviderSupplierTest {
   }
 
   @Test
+  @SuppressWarnings("unchecked")
   public void systemRootCertsWithMtls_callbackExecutedFromProvider() {
     upstreamTlsContext =
         CommonTlsContextTestsUtil.buildNewUpstreamTlsContextForCertProviderInstance(
@@ -174,8 +175,7 @@ public class SslContextProviderSupplierTest {
     SslContextProvider.Callback capturedCallback = callbackCaptor.getValue();
     assertThat(capturedCallback).isNotNull();
     AbstractMap.SimpleImmutableEntry<SslContext, TrustManager> mockSslContextAndTm =
-        (AbstractMap.SimpleImmutableEntry<SslContext, TrustManager>)
-            mock(AbstractMap.SimpleImmutableEntry.class);
+        mock(AbstractMap.SimpleImmutableEntry.class);
     capturedCallback.updateSslContextAndExtendedX509TrustManager(mockSslContextAndTm);
     verify(mockCallback, times(1))
         .updateSslContextAndExtendedX509TrustManager(eq(mockSslContextAndTm));

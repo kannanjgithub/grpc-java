@@ -53,7 +53,6 @@ import javax.net.ssl.X509ExtendedTrustManager;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.junit.runners.JUnit4;
 import org.junit.runners.Parameterized;
 import org.mockito.Mock;
 import org.mockito.junit.MockitoJUnit;
@@ -75,16 +74,18 @@ public class XdsX509TrustManagerTest {
   private SSLSession mockSession;
 
   private XdsX509TrustManager trustManager;
+  private boolean isClient;
   private boolean useSniForSanMatching;
 
   @Parameterized.Parameters
   public static Collection<Object[]> data() {
     return Arrays.asList(new Object[][] {
-            { true }, { false }
+            { true, true }, { true, false }, {false, false}
     });
   }
 
-  public XdsX509TrustManagerTest(boolean useSniForSanMatching) {
+  public XdsX509TrustManagerTest(boolean isClient, boolean useSniForSanMatching) {
+    this.isClient = isClient;
     this.useSniForSanMatching = useSniForSanMatching;
   }
 
@@ -93,7 +94,11 @@ public class XdsX509TrustManagerTest {
     trustManager = new XdsX509TrustManager(null, mockDelegate);
     X509Certificate[] certs =
         CertificateUtils.toX509Certificates(TlsTesting.loadCert(SERVER_1_PEM_FILE));
-    trustManager.verifySubjectAltNameInChain(certs);
+    if (isClient) {
+      trustManager.checkClientTrusted(certs, "RSA");
+    } else {
+      trustManager.checkServerTrusted(certs, "ECDHE_ECDSA");
+    }
   }
 
   @Test
@@ -102,7 +107,11 @@ public class XdsX509TrustManagerTest {
     trustManager = new XdsX509TrustManager(certContext, mockDelegate);
     X509Certificate[] certs =
         CertificateUtils.toX509Certificates(TlsTesting.loadCert(SERVER_1_PEM_FILE));
-    trustManager.verifySubjectAltNameInChain(certs);
+    if (isClient) {
+      trustManager.checkClientTrusted(certs, "RSA");
+    } else {
+      trustManager.checkServerTrusted(certs, "ECDHE_ECDSA");
+    }
   }
 
   @Test
@@ -110,7 +119,7 @@ public class XdsX509TrustManagerTest {
     if (useSniForSanMatching) {
       CertificateUtils.isXdsSniEnabled = true;
       trustManager = new XdsX509TrustManager(
-              CertificateValidationContext.getDefaultInstance(), mockDelegate, "foo.com");
+              CertificateValidationContext.getDefaultInstance(), mockDelegate);
     } else {
       StringMatcher stringMatcher = StringMatcher.newBuilder().setExact("foo.com").build();
       @SuppressWarnings("deprecation")
@@ -119,7 +128,11 @@ public class XdsX509TrustManagerTest {
       trustManager = new XdsX509TrustManager(certContext, mockDelegate);
     }
     try {
-      trustManager.verifySubjectAltNameInChain(null);
+      if (isClient) {
+        trustManager.checkClientTrusted(null, "RSA");
+      } else {
+        trustManager.checkServerTrusted(null, "ECDHE_ECDSA");
+      }
       fail("no exception thrown");
     } catch (CertificateException expected) {
       assertThat(expected).hasMessageThat().isEqualTo("Peer certificate(s) missing");
@@ -135,7 +148,7 @@ public class XdsX509TrustManagerTest {
     if (useSniForSanMatching) {
       CertificateUtils.isXdsSniEnabled = true;
       trustManager = new XdsX509TrustManager(
-              CertificateValidationContext.getDefaultInstance(), mockDelegate, "foo.com");
+              CertificateValidationContext.getDefaultInstance(), mockDelegate);
     } else {
       StringMatcher stringMatcher = StringMatcher.newBuilder().setExact("foo.com").build();
       @SuppressWarnings("deprecation")
@@ -144,7 +157,11 @@ public class XdsX509TrustManagerTest {
       trustManager = new XdsX509TrustManager(certContext, mockDelegate);
     }
     try {
-      trustManager.verifySubjectAltNameInChain(new X509Certificate[0]);
+      if (isClient) {
+        trustManager.checkClientTrusted(new X509Certificate[0], "RSA");
+      } else {
+        trustManager.checkServerTrusted(new X509Certificate[0], "ECDHE_ECDSA");
+      }
       fail("no exception thrown");
     } catch (CertificateException expected) {
       assertThat(expected).hasMessageThat().isEqualTo("Peer certificate(s) missing");
@@ -160,7 +177,7 @@ public class XdsX509TrustManagerTest {
     if (useSniForSanMatching) {
       CertificateUtils.isXdsSniEnabled = true;
       trustManager = new XdsX509TrustManager(
-              CertificateValidationContext.getDefaultInstance(), mockDelegate, "foo.com");
+              CertificateValidationContext.getDefaultInstance(), mockDelegate);
     } else {
       StringMatcher stringMatcher = StringMatcher.newBuilder().setExact("foo.com").build();
       @SuppressWarnings("deprecation")
@@ -171,7 +188,11 @@ public class XdsX509TrustManagerTest {
     X509Certificate[] certs =
         CertificateUtils.toX509Certificates(TlsTesting.loadCert(CLIENT_PEM_FILE));
     try {
-      trustManager.verifySubjectAltNameInChain(certs);
+      if (isClient) {
+        trustManager.checkClientTrusted(new X509Certificate[0], "RSA");
+      } else {
+        trustManager.checkServerTrusted(new X509Certificate[0], "ECDHE_ECDSA");
+      }
       fail("no exception thrown");
     } catch (CertificateException expected) {
       assertThat(expected).hasMessageThat().isEqualTo("Peer certificate SAN check failed");
@@ -184,27 +205,27 @@ public class XdsX509TrustManagerTest {
 
   @Test
   public void oneSanInPeerCertsVerifies() throws CertificateException, IOException {
-    if (useSniForSanMatching) {
+    StringMatcher.Builder stringMatcher = StringMatcher.newBuilder().setIgnoreCase(false);
+    if (isClient && useSniForSanMatching) {
       CertificateUtils.isXdsSniEnabled = true;
-          trustManager = new XdsX509TrustManager(
-              CertificateValidationContext.getDefaultInstance(), mockDelegate, "waterzooi.test.google.be");
+      stringMatcher = stringMatcher.setExact("waterzooi.test.google.be");
     } else {
-      StringMatcher stringMatcher =
-              StringMatcher.newBuilder()
-                      .setExact("waterzooi.test.google.be")
-                      .setIgnoreCase(false)
-                      .build();
-      @SuppressWarnings("deprecation")
-      CertificateValidationContext certContext =
-              CertificateValidationContext.newBuilder().addMatchSubjectAltNames(stringMatcher).build();
-      trustManager = new XdsX509TrustManager(certContext, mockDelegate);
+      stringMatcher = stringMatcher.setExact("notgonnabeused.test.google.be");
     }
+    @SuppressWarnings("deprecation")
+    CertificateValidationContext certContext =
+        CertificateValidationContext.newBuilder().addMatchSubjectAltNames(stringMatcher).build();
+    trustManager = new XdsX509TrustManager(certContext, mockDelegate);
     try {
       X509Certificate[] certs =
           CertificateUtils.toX509Certificates(TlsTesting.loadCert(SERVER_1_PEM_FILE));
-      trustManager.verifySubjectAltNameInChain(certs);
+      if (isClient) {
+        trustManager.checkClientTrusted(new X509Certificate[0], "RSA");
+      } else {
+        trustManager.checkServerTrusted(new X509Certificate[0], "ECDHE_ECDSA");
+      }
     } finally {
-      if (useSniForSanMatching) {
+      if (isClient && useSniForSanMatching) {
         CertificateUtils.isXdsSniEnabled = false;
       }
     }
@@ -222,7 +243,7 @@ public class XdsX509TrustManagerTest {
       @SuppressWarnings("deprecation")
       CertificateValidationContext certContext =
           CertificateValidationContext.newBuilder().addMatchSubjectAltNames(stringMatcher).build();
-      trustManager = new XdsX509TrustManager(certContext, mockDelegate, "waterzooi.test.google.be");
+      trustManager = new XdsX509TrustManager(certContext, mockDelegate);
       X509Certificate[] certs =
           CertificateUtils.toX509Certificates(TlsTesting.loadCert(SERVER_1_PEM_FILE));
       trustManager.verifySubjectAltNameInChain(certs);
@@ -241,7 +262,7 @@ public class XdsX509TrustManagerTest {
     @SuppressWarnings("deprecation")
     CertificateValidationContext certContext =
             CertificateValidationContext.newBuilder().addMatchSubjectAltNames(stringMatcher).build();
-    trustManager = new XdsX509TrustManager(certContext, mockDelegate, "");
+    trustManager = new XdsX509TrustManager(certContext, mockDelegate);
     X509Certificate[] certs =
             CertificateUtils.toX509Certificates(TlsTesting.loadCert(SERVER_1_PEM_FILE));
     trustManager.verifySubjectAltNameInChain(certs);
@@ -515,8 +536,8 @@ public class XdsX509TrustManagerTest {
           throws CertificateException, IOException {
     if (useSniForSanMatching) {
       CertificateUtils.isXdsSniEnabled = true;
-      trustManager = new XdsX509TrustManager(CertificateValidationContext.getDefaultInstance(), mockDelegate,
-              "x.foo.com");
+      trustManager = new XdsX509TrustManager(CertificateValidationContext.getDefaultInstance(), mockDelegate
+      );
     } else {
       StringMatcher stringMatcher = StringMatcher.newBuilder().setExact("x.foo.com").build();
       @SuppressWarnings("deprecation")
@@ -583,7 +604,7 @@ public class XdsX509TrustManagerTest {
     if (useSniForSanMatching) {
       CertificateUtils.isXdsSniEnabled = true;
       trustManager = new XdsX509TrustManager(CertificateValidationContext.getDefaultInstance(),
-              mockDelegate, "sub.abc.test.youtube.com");
+              mockDelegate);
     } else {
       StringMatcher stringMatcher =
               StringMatcher.newBuilder().setExact("sub.abc.test.youtube.com").build();
@@ -624,8 +645,8 @@ public class XdsX509TrustManagerTest {
 
   @Test
   public void oneIpAddressInPeerCertsVerifies_autoSniSanValidation() throws CertificateException, IOException {
-    trustManager = new XdsX509TrustManager(CertificateValidationContext.getDefaultInstance(), mockDelegate,
-            "192.168.1.3");
+    trustManager = new XdsX509TrustManager(CertificateValidationContext.getDefaultInstance(), mockDelegate
+    );
     X509Certificate[] certs =
             CertificateUtils.toX509Certificates(TlsTesting.loadCert(SERVER_1_PEM_FILE));
     trustManager.verifySubjectAltNameInChain(certs);
@@ -654,8 +675,8 @@ public class XdsX509TrustManagerTest {
 
   @Test
   public void oneIpAddressInPeerCertsMismatch_autoSniSanValidation() throws CertificateException, IOException {
-    trustManager = new XdsX509TrustManager(CertificateValidationContext.getDefaultInstance(), mockDelegate,
-            "192.168.1.3");
+    trustManager = new XdsX509TrustManager(CertificateValidationContext.getDefaultInstance(), mockDelegate
+    );
     X509Certificate[] certs =
             CertificateUtils.toX509Certificates(TlsTesting.loadCert(SERVER_1_PEM_FILE));
     trustManager.verifySubjectAltNameInChain(certs);

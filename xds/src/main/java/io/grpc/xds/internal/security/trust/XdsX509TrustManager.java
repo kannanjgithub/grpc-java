@@ -23,6 +23,7 @@ import com.google.common.base.Optional;
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Lists;
 import com.google.re2j.Pattern;
 import io.envoyproxy.envoy.extensions.transport_sockets.tls.v3.CertificateValidationContext;
 import io.envoyproxy.envoy.type.matcher.v3.RegexMatcher;
@@ -32,6 +33,7 @@ import java.net.Socket;
 import java.security.cert.CertificateException;
 import java.security.cert.CertificateParsingException;
 import java.security.cert.X509Certificate;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashSet;
@@ -40,6 +42,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import javax.annotation.Nullable;
+import javax.net.ssl.SNIHostName;
+import javax.net.ssl.SNIServerName;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
@@ -61,30 +65,21 @@ final class XdsX509TrustManager extends X509ExtendedTrustManager implements X509
   private final X509ExtendedTrustManager delegate;
   private final Map<String, X509ExtendedTrustManager> spiffeTrustMapDelegates;
   private final CertificateValidationContext certContext;
-  private final String sniForSanMatching;
 
   XdsX509TrustManager(@Nullable CertificateValidationContext certContext,
                       X509ExtendedTrustManager delegate) {
-    this(certContext, delegate, null);
-  }
-
-  XdsX509TrustManager(@Nullable CertificateValidationContext certContext,
-                      X509ExtendedTrustManager delegate, @Nullable String sniForSanMatching) {
     checkNotNull(delegate, "delegate");
     this.certContext = certContext;
     this.delegate = delegate;
     this.spiffeTrustMapDelegates = null;
-    this.sniForSanMatching = sniForSanMatching;
   }
 
   XdsX509TrustManager(@Nullable CertificateValidationContext certContext,
-      Map<String, X509ExtendedTrustManager> spiffeTrustMapDelegates,
-      @Nullable String sniForSanMatching) {
+      Map<String, X509ExtendedTrustManager> spiffeTrustMapDelegates) {
     checkNotNull(spiffeTrustMapDelegates, "spiffeTrustMapDelegates");
     this.spiffeTrustMapDelegates = ImmutableMap.copyOf(spiffeTrustMapDelegates);
     this.certContext = certContext;
     this.delegate = null;
-    this.sniForSanMatching = sniForSanMatching;
   }
 
   private static boolean verifyDnsNameInPattern(
@@ -213,15 +208,10 @@ final class XdsX509TrustManager extends X509ExtendedTrustManager implements X509
    * This is called from various check*Trusted methods.
    */
   @VisibleForTesting
-  void verifySubjectAltNameInChain(X509Certificate[] peerCertChain) throws CertificateException {
+  void verifySubjectAltNameInChain(X509Certificate[] peerCertChain, List<StringMatcher> verifyList) throws CertificateException {
     if (certContext == null) {
       return;
     }
-    @SuppressWarnings("deprecation") // gRFC A29 predates match_typed_subject_alt_names
-    List<StringMatcher> verifyList =
-        CertificateUtils.isXdsSniEnabled && !Strings.isNullOrEmpty(sniForSanMatching)
-            ? ImmutableList.of(StringMatcher.newBuilder().setExact(sniForSanMatching).build())
-            : certContext.getMatchSubjectAltNamesList();
     if (verifyList.isEmpty()) {
       return;
     }
@@ -233,24 +223,27 @@ final class XdsX509TrustManager extends X509ExtendedTrustManager implements X509
   }
 
   @Override
+  @SuppressWarnings("deprecation") // gRFC A29 predates match_typed_subject_alt_names
   public void checkClientTrusted(X509Certificate[] chain, String authType, Socket socket)
       throws CertificateException {
     chooseDelegate(chain).checkClientTrusted(chain, authType, socket);
-    verifySubjectAltNameInChain(chain);
+    verifySubjectAltNameInChain(chain, certContext.getMatchSubjectAltNamesList());
   }
 
   @Override
+  @SuppressWarnings("deprecation") // gRFC A29 predates match_typed_subject_alt_names
   public void checkClientTrusted(X509Certificate[] chain, String authType, SSLEngine sslEngine)
       throws CertificateException {
     chooseDelegate(chain).checkClientTrusted(chain, authType, sslEngine);
-    verifySubjectAltNameInChain(chain);
+    verifySubjectAltNameInChain(chain, certContext.getMatchSubjectAltNamesList());
   }
 
   @Override
+  @SuppressWarnings("deprecation") // gRFC A29 predates match_typed_subject_alt_names
   public void checkClientTrusted(X509Certificate[] chain, String authType)
       throws CertificateException {
     chooseDelegate(chain).checkClientTrusted(chain, authType);
-    verifySubjectAltNameInChain(chain);
+    verifySubjectAltNameInChain(chain, certContext.getMatchSubjectAltNamesList());
   }
 
   @Override
@@ -265,7 +258,22 @@ final class XdsX509TrustManager extends X509ExtendedTrustManager implements X509
       }
     }
     chooseDelegate(chain).checkServerTrusted(chain, authType, socket);
-    verifySubjectAltNameInChain(chain);
+    List<StringMatcher> sniMatchers = null;
+    if (CertificateUtils.isXdsSniEnabled) {
+      List<SNIServerName> serverNames = ((SSLSocket) socket).getSSLParameters().getServerNames();
+      if (serverNames != null) {
+        for (SNIServerName name : serverNames) {
+          if (name instanceof SNIHostName) {
+            sniMatchers = new ArrayList<>();
+            sniMatchers.add(StringMatcher.newBuilder().setExact(((SNIHostName) name).getAsciiName()).build());
+          }
+        }
+      }
+    }
+    if (sniMatchers == null) {
+      sniMatchers = certContext.getMatchSubjectAltNamesList();
+    }
+    verifySubjectAltNameInChain(chain, sniMatchers);
   }
 
   @Override

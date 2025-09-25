@@ -130,7 +130,7 @@ public final class XdsTrustManagerFactory extends SimpleTrustManagerFactory {
   static XdsX509TrustManager createX509TrustManager(
       X509Certificate[] certs, CertificateValidationContext certContext, String sniForSanMatching)
       throws CertStoreException {
-    return new XdsX509TrustManager(certContext, createTrustManager(certs), sniForSanMatching);
+    return new XdsX509TrustManager(certContext, createTrustManager(certs));
   }
 
   @VisibleForTesting
@@ -144,7 +144,7 @@ public final class XdsTrustManagerFactory extends SimpleTrustManagerFactory {
       delegates.put(entry.getKey(), createTrustManager(
           entry.getValue().toArray(new X509Certificate[0])));
     }
-    return new XdsX509TrustManager(certContext, delegates, sniForSanMatching);
+    return new XdsX509TrustManager(certContext, delegates);
   }
 
   private static X509ExtendedTrustManager createTrustManager(X509Certificate[] certs)
