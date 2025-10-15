@@ -20,6 +20,8 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.errorprone.annotations.CheckReturnValue;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /** Monitors the client's PING usage to make sure the rate is permitted. */
 public final class KeepAliveEnforcer {
@@ -36,7 +38,7 @@ public final class KeepAliveEnforcer {
   private long lastValidPingTime;
   private boolean hasOutstandingCalls;
   private int pingStrikes;
-
+  private static final Logger log = Logger.getLogger(KeepAliveEnforcer.class.getName());
   public KeepAliveEnforcer(boolean permitWithoutCalls, long minTime, TimeUnit unit) {
     this(permitWithoutCalls, minTime, unit, SystemTicker.INSTANCE);
   }
@@ -50,6 +52,7 @@ public final class KeepAliveEnforcer {
     this.ticker = ticker;
     this.epoch = ticker.nanoTime();
     lastValidPingTime = epoch;
+    log.log(Level.INFO, "minTimeNanos=" + minTimeNanos);
   }
 
   /** Returns {@code false} when client is misbehaving and should be disconnected. */
@@ -57,17 +60,26 @@ public final class KeepAliveEnforcer {
   public boolean pingAcceptable() {
     long now = ticker.nanoTime();
     boolean valid;
-    if (!hasOutstandingCalls && !permitWithoutCalls) {
-      valid = compareNanos(lastValidPingTime + IMPLICIT_PERMIT_TIME_NANOS, now) <= 0;
-    } else {
-      valid = compareNanos(lastValidPingTime + minTimeNanos, now) <= 0;
-    }
-    if (!valid) {
-      pingStrikes++;
-      return pingStrikes <= MAX_PING_STRIKES;
-    } else {
-      lastValidPingTime = now;
-      return true;
+    log.log(Level.INFO, "Enter pingAcceptable.");
+    try {
+      if (!hasOutstandingCalls && !permitWithoutCalls) {
+        valid = compareNanos(lastValidPingTime + IMPLICIT_PERMIT_TIME_NANOS, now) <= 0;
+      } else {
+        valid = compareNanos(lastValidPingTime + minTimeNanos, now) <= 0;
+        log.log(Level.INFO, String.format("lastValidPingTime + minTimeNanos =%d, now=%d, difference=%fs, valid=%s.",
+            lastValidPingTime + minTimeNanos, now, (now - lastValidPingTime - minTimeNanos) / 1_000_000_000.0, valid));
+      }
+      if (!valid) {
+        pingStrikes++;
+        log.log(Level.INFO, "Not valid. pingStrikes=" + pingStrikes + ". Returning " + (pingStrikes <= MAX_PING_STRIKES));
+        return pingStrikes <= MAX_PING_STRIKES;
+      } else {
+        log.log(Level.INFO, "Valid. Setting lastValidPingTime to now.");
+        lastValidPingTime = now;
+        return true;
+      }
+    } finally {
+      log.log(Level.INFO, "Exit pingAcceptable.");
     }
   }
 
