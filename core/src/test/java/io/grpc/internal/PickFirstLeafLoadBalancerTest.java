@@ -402,11 +402,23 @@ public class PickFirstLeafLoadBalancerTest {
         Lists.newArrayList(new EquivalentAddressGroup(socketAddr2));
 
     // accept resolved addresses which starts connection attempt to first address
+    InOrder inOrder = inOrder(mockHelper, mockSubchannel1);
     loadBalancer.acceptResolvedAddresses(
         ResolvedAddresses.newBuilder().setAddresses(oldServers).setAttributes(affinity).build());
     verify(mockHelper).updateBalancingState(eq(CONNECTING), pickerCaptor.capture());
+    verify(mockHelper).createSubchannel(createArgsCaptor.capture());
+    inOrder.verify(mockSubchannel1).start(stateListenerCaptor.capture());
+    SubchannelStateListener stateListener = stateListenerCaptor.getValue();
     assertNull(pickerCaptor.getValue().pickSubchannel(mockArgs).getSubchannel());
+    stateListener.onSubchannelState(ConnectivityStateInfo.forNonError(READY));
 
+    // Connection breaks
+    stateListener.onSubchannelState(ConnectivityStateInfo.forNonError(IDLE));
+    inOrder.verify(mockHelper).refreshNameResolution();
+    inOrder.verify(mockHelper).updateBalancingState(eq(IDLE), pickerCaptor.capture());
+    assertEquals(Status.OK, pickerCaptor.getValue().pickSubchannel(mockArgs).getStatus());
+
+    // Re-resolution result from NR
     // updating the subchannel addresses is unnecessary, but doesn't hurt anything
     loadBalancer.acceptResolvedAddresses(
         ResolvedAddresses.newBuilder().setAddresses(newServers).setAttributes(affinity).build());
