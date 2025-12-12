@@ -266,11 +266,14 @@ public final class XdsTestClient {
   private void run() {
     if (enableCsmObservability) {
       csmObservability = CsmObservability.newBuilder()
+          .enableTracing()
           .sdk(AutoConfiguredOpenTelemetrySdk.builder()
               .addPropertiesSupplier(() -> ImmutableMap.of(
                   "otel.logs.exporter", "none",
                   "otel.metrics.exporter", "prometheus",
-                  "otel.traces.exporter", "none"))
+                  "otel.traces.exporter", "otlp",
+                  "otel.exporter.otlp.endpoint", "https://telemetry.googleapis.com",
+                  "otel.exporter.otlp.protocol", "http/protobuf"))
               .build()
               .getOpenTelemetrySdk())
           .build();

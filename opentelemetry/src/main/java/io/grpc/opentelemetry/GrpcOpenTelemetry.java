@@ -416,7 +416,7 @@ public final class GrpcOpenTelemetry {
       return this;
     }
 
-    Builder enableTracing(boolean enable) {
+    public Builder enableTracing(boolean enable) {
       ENABLE_OTEL_TRACING = enable;
       return this;
     }

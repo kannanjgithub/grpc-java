@@ -133,6 +133,11 @@ public final class CsmObservability implements Closeable {
       return this;
     }
 
+    public Builder enableTracing() {
+      delegate.enableTracing(true);
+      return this;
+    }
+
     /**
      * Disables the specified metrics from being collected and exported.
      */

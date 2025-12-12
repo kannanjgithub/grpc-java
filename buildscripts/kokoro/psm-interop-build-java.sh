@@ -31,7 +31,7 @@ readonly BUILD_APP_PATH="interop-testing/build/install/grpc-interop-testing"
 #   Writes the output of xds-test-client and xds-test-server --help to stderr
 #######################################
 _build_java_test_app() {
-  psm::tools::log "Building Java test app"
+  echo "Building Java test app"
   cd "${SRC_DIR}"
 
   set -x
@@ -40,9 +40,9 @@ _build_java_test_app() {
     -PskipCodegen=true -PskipAndroid=true --console=plain
   set +x
 
-  psm::tools::log "Test-run grpc-java PSM interop binaries"
-  psm::tools::run_ignore_exit_code "${SRC_DIR}/${BUILD_APP_PATH}/bin/xds-test-client" --help
-  psm::tools::run_ignore_exit_code "${SRC_DIR}/${BUILD_APP_PATH}/bin/xds-test-server" --help
+  #echo "Test-run grpc-java PSM interop binaries"
+  #psm::tools::run_ignore_exit_code "${SRC_DIR}/${BUILD_APP_PATH}/bin/xds-test-client" --help
+  #psm::tools::run_ignore_exit_code "${SRC_DIR}/${BUILD_APP_PATH}/bin/xds-test-server" --help
 }
 
 #######################################
@@ -62,7 +62,7 @@ psm::lang::build_docker_images() {
   local java_build_log="${BUILD_LOGS_ROOT}/build-lang-java.log"
   _build_java_test_app |& tee "${java_build_log}"
 
-  psm::tools::log "Building Java xDS interop test app Docker images"
+  echo "Building Java xDS interop test app Docker images"
   local docker_dir="${SRC_DIR}/buildscripts/xds-k8s"
   local build_dir
   build_dir="$(mktemp -d)"

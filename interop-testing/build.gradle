@@ -9,6 +9,9 @@ plugins {
 
 description = "gRPC: Integration Testing"
 
+def openTelemetryVersion = '1.56.0'
+def openTelemetryContribVersion = '1.52.0'
+
 dependencies {
     implementation project(path: ':grpc-alts', configuration: 'shadow'),
             project(':grpc-auth'),
@@ -45,6 +48,9 @@ dependencies {
             project(':grpc-googleapis'),
             project(':grpc-grpclb'),
             project(':grpc-rls')
+    runtimeOnly group: 'io.opentelemetry', name: 'opentelemetry-exporter-otlp', version: "${openTelemetryVersion}"
+    runtimeOnly group: 'io.opentelemetry.contrib', name: 'opentelemetry-gcp-resources', version: "${openTelemetryContribVersion}-alpha"
+    runtimeOnly group: 'io.opentelemetry.contrib', name: 'opentelemetry-gcp-auth-extension', version: "${openTelemetryContribVersion}-alpha"
     testImplementation testFixtures(project(':grpc-api')),
             testFixtures(project(':grpc-core')),
             project(':grpc-inprocess'),
