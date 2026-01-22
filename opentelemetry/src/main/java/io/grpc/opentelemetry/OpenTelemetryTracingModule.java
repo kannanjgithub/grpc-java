@@ -42,6 +42,7 @@ import io.grpc.opentelemetry.internal.OpenTelemetryConstants;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.baggage.Baggage;
 import io.opentelemetry.api.common.AttributesBuilder;
+import io.opentelemetry.api.logs.Severity;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.StatusCode;
 import io.opentelemetry.api.trace.Tracer;
@@ -68,7 +69,7 @@ final class OpenTelemetryTracingModule {
   private static final AtomicIntegerFieldUpdater<ServerTracer> streamClosedUpdater;
 
   /*
-   * When using Atomic*FieldUpdater, some Samsung Android 5.0.x devices encounter a bug in their JDK
+   * When using Atomic*FieldUpdater, some Samsung Android 5.0.x devices encounter a bug in their
    * reflection API that triggers a NoSuchFieldException. When this occurs, we fallback to
    * (potentially racy) direct updates of the volatile variables.
    */
@@ -97,6 +98,7 @@ final class OpenTelemetryTracingModule {
   private final ServerInterceptor serverSpanPropagationInterceptor =
       new TracingServerSpanPropagationInterceptor();
   private final ServerTracerFactory serverTracerFactory = new ServerTracerFactory();
+  private final io.opentelemetry.api.logs.Logger otelLogger;
 
   OpenTelemetryTracingModule(OpenTelemetry openTelemetry) {
     this.otelTracer = checkNotNull(openTelemetry.getTracerProvider(), "tracerProvider")
@@ -104,6 +106,9 @@ final class OpenTelemetryTracingModule {
         .setInstrumentationVersion(IMPLEMENTATION_VERSION)
         .build();
     this.contextPropagators = checkNotNull(openTelemetry.getPropagators(), "contextPropagators");
+    this.otelLogger = openTelemetry.getLogsBridge().loggerBuilder("grpc-java-client-scope")
+        .setInstrumentationVersion("1.0.0")
+        .build();
   }
 
   @VisibleForTesting
@@ -116,7 +121,7 @@ final class OpenTelemetryTracingModule {
    */
   @VisibleForTesting
   CallAttemptsTracerFactory newClientCallTracer(Span clientSpan, MethodDescriptor<?, ?> method) {
-    return new CallAttemptsTracerFactory(clientSpan, method);
+    return new CallAttemptsTracerFactory(clientSpan, method, otelLogger);
   }
 
   /**
@@ -142,11 +147,14 @@ final class OpenTelemetryTracingModule {
     volatile int callEnded;
     private final Span clientSpan;
     private final String fullMethodName;
+    private final io.opentelemetry.api.logs.Logger otelLogger;
 
-    CallAttemptsTracerFactory(Span clientSpan, MethodDescriptor<?, ?> method) {
+    CallAttemptsTracerFactory(Span clientSpan, MethodDescriptor<?, ?> method,
+        io.opentelemetry.api.logs.Logger otelLogger) {
       checkNotNull(method, "method");
       this.fullMethodName = checkNotNull(method.getFullMethodName(), "fullMethodName");
       this.clientSpan = checkNotNull(clientSpan, "clientSpan");
+      this.otelLogger = otelLogger;
     }
 
     @Override
@@ -464,6 +472,11 @@ final class OpenTelemetryTracingModule {
       attributesBuilder.put("message-size-compressed", optionalWireSize);
     }
     span.addEvent("Outbound message", attributesBuilder.build());
+    otelLogger.logRecordBuilder().setSeverity(Severity.INFO)
+        .setSeverityText("INFO")
+        .setBody("outbound message event") // The main message body
+        .setAllAttributes(attributesBuilder.build())
+        .emit();
   }
 
   private void recordInboundCompressedMessage(Span span, int seqNo, long optionalWireSize) {
