@@ -269,10 +269,13 @@ public final class XdsTestClient {
           .enableTracing()
           .sdk(AutoConfiguredOpenTelemetrySdk.builder()
               .addPropertiesSupplier(() -> ImmutableMap.of(
-                  "otel.logs.exporter", "otlp",
                   "otel.metrics.exporter", "prometheus",
+                  "otel.logs.exporter", "otlp",
                   "otel.traces.exporter", "otlp",
+                  // Only handles traces
                   "otel.exporter.otlp.endpoint", "https://telemetry.googleapis.com",
+                  // Set logs endpoint to the OTLP default Collector
+                  "otel.exporter.otlp.logs.endpoint", "http://localhost:4317",
                   "otel.exporter.otlp.protocol", "http/protobuf"))
               .build()
               .getOpenTelemetrySdk())

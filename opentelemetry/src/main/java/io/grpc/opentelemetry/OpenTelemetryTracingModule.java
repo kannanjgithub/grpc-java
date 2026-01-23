@@ -106,9 +106,9 @@ final class OpenTelemetryTracingModule {
         .setInstrumentationVersion(IMPLEMENTATION_VERSION)
         .build();
     this.contextPropagators = checkNotNull(openTelemetry.getPropagators(), "contextPropagators");
-    this.otelLogger = openTelemetry.getLogsBridge().loggerBuilder("grpc-java-client-scope")
-        .setInstrumentationVersion("1.0.0")
-        .build();
+
+    // 3. Get a Logger from the Bridge API
+    this.otelLogger = openTelemetry.getLogsBridge().get("io.grpc.opentelemetry");
   }
 
   @VisibleForTesting
@@ -121,7 +121,7 @@ final class OpenTelemetryTracingModule {
    */
   @VisibleForTesting
   CallAttemptsTracerFactory newClientCallTracer(Span clientSpan, MethodDescriptor<?, ?> method) {
-    return new CallAttemptsTracerFactory(clientSpan, method, otelLogger);
+    return new CallAttemptsTracerFactory(clientSpan, method);
   }
 
   /**
@@ -147,14 +147,11 @@ final class OpenTelemetryTracingModule {
     volatile int callEnded;
     private final Span clientSpan;
     private final String fullMethodName;
-    private final io.opentelemetry.api.logs.Logger otelLogger;
 
-    CallAttemptsTracerFactory(Span clientSpan, MethodDescriptor<?, ?> method,
-        io.opentelemetry.api.logs.Logger otelLogger) {
+    CallAttemptsTracerFactory(Span clientSpan, MethodDescriptor<?, ?> method) {
       checkNotNull(method, "method");
       this.fullMethodName = checkNotNull(method.getFullMethodName(), "fullMethodName");
       this.clientSpan = checkNotNull(clientSpan, "clientSpan");
-      this.otelLogger = otelLogger;
     }
 
     @Override
