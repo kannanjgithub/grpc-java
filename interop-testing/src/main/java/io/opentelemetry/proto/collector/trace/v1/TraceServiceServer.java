@@ -6,6 +6,7 @@ import io.grpc.InsecureServerCredentials;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 
+import java.io.IOException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -39,10 +40,10 @@ public class TraceServiceServer {
     server.blockUntilShutdown();
   }
 
-  private void start() {
+  private void start() throws IOException {
     executor = Executors.newSingleThreadScheduledExecutor();
     server = Grpc.newServerBuilderForPort(port, InsecureServerCredentials.create())
-        .addService(new TraceServiceImpl()).build();
+        .addService(new TraceServiceImpl()).build().start();
   }
 
   void stop() throws Exception {

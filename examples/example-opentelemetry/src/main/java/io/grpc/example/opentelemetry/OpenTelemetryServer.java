@@ -23,10 +23,22 @@ import io.grpc.examples.helloworld.GreeterGrpc;
 import io.grpc.examples.helloworld.HelloReply;
 import io.grpc.examples.helloworld.HelloRequest;
 import io.grpc.opentelemetry.GrpcOpenTelemetry;
+import io.grpc.opentelemetry.GrpcTraceBinContextPropagator;
 import io.grpc.stub.StreamObserver;
+import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.context.propagation.ContextPropagators;
+import io.opentelemetry.context.propagation.TextMapPropagator;
 import io.opentelemetry.exporter.prometheus.PrometheusHttpServer;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
 import io.opentelemetry.sdk.metrics.SdkMeterProvider;
+import io.opentelemetry.sdk.resources.Resource;
+import io.opentelemetry.sdk.trace.SdkTracerProvider;
+import io.opentelemetry.sdk.trace.SpanProcessor;
+import io.opentelemetry.sdk.trace.export.BatchSpanProcessor;
+import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
+import io.opentelemetry.semconv.ResourceAttributes;
+import io.opentelemetry.exporter.otlp.trace.OtlpGrpcSpanExporter;
+
 import java.io.IOException;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
@@ -94,8 +106,28 @@ public class OpenTelemetryServer {
           .build();
 
       // Initialize OpenTelemetry SDK with MeterProvider configured with Prometheus metrics exporter
+      // Define resource attributes (e.g., service name)
+      Resource resource = Resource.create(
+          Attributes.of(ResourceAttributes.SERVICE_NAME, "server-service")
+      );
+
+      // Configure the OTLP Span Exporter with the custom Collector endpoint
+      OtlpGrpcSpanExporter spanExporter = OtlpGrpcSpanExporter.builder()
+          .setEndpoint("http://localhost:7080") // Default OTLP gRPC port
+          .build();
+
+      SpanProcessor spanProcessor = SimpleSpanProcessor.create(spanExporter);
+
+      // Create the SdkTracerProvider
+      SdkTracerProvider sdkTracerProvider = SdkTracerProvider.builder()
+          .addSpanProcessor(spanProcessor)
+          .setResource(resource)
+          .build();
       OpenTelemetrySdk openTelemetrySdk =
-          OpenTelemetrySdk.builder().setMeterProvider(sdkMeterProvider).build();
+          OpenTelemetrySdk.builder().setTracerProvider(sdkTracerProvider)
+              .setPropagators(ContextPropagators.create(TextMapPropagator.composite(
+                  GrpcTraceBinContextPropagator.defaultInstance()
+              ))).setMeterProvider(sdkMeterProvider).build();
 
       // Initialize gRPC OpenTelemetry.
       // Following client metrics are enabled by default :

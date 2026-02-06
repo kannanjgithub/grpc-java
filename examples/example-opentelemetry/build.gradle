@@ -33,6 +33,8 @@ dependencies {
     implementation "io.opentelemetry:opentelemetry-sdk:${openTelemetryVersion}"
     implementation "io.opentelemetry:opentelemetry-sdk-metrics:${openTelemetryVersion}"
     implementation "io.opentelemetry:opentelemetry-exporter-logging:${openTelemetryVersion}"
+    implementation "io.opentelemetry:opentelemetry-exporter-otlp:${openTelemetryVersion}"
+    implementation "io.opentelemetry.semconv:opentelemetry-semconv:1.29.0-alpha"
     implementation "io.opentelemetry:opentelemetry-exporter-prometheus:${openTelemetryPrometheusVersion}"
     runtimeOnly "io.grpc:grpc-netty-shaded:${grpcVersion}"
 }
