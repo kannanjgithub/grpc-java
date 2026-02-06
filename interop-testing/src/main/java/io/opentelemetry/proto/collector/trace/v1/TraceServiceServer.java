@@ -12,7 +12,7 @@ import java.util.concurrent.TimeUnit;
 
 public class TraceServiceServer {
 
-  private int port = 8080;
+  private int port = 7080;
   private Server server;
   private ScheduledExecutorService executor;
   public static void main(String[] args) throws Exception {
