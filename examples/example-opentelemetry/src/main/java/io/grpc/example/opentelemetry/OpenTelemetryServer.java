@@ -23,10 +23,22 @@ import io.grpc.examples.helloworld.GreeterGrpc;
 import io.grpc.examples.helloworld.HelloReply;
 import io.grpc.examples.helloworld.HelloRequest;
 import io.grpc.opentelemetry.GrpcOpenTelemetry;
+import io.grpc.opentelemetry.GrpcTraceBinContextPropagator;
 import io.grpc.stub.StreamObserver;
+import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.context.propagation.ContextPropagators;
+import io.opentelemetry.context.propagation.TextMapPropagator;
 import io.opentelemetry.exporter.prometheus.PrometheusHttpServer;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
 import io.opentelemetry.sdk.metrics.SdkMeterProvider;
+import io.opentelemetry.sdk.resources.Resource;
+import io.opentelemetry.sdk.trace.SdkTracerProvider;
+import io.opentelemetry.sdk.trace.SpanProcessor;
+import io.opentelemetry.sdk.trace.export.BatchSpanProcessor;
+import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
+import io.opentelemetry.semconv.ResourceAttributes;
+import io.opentelemetry.exporter.otlp.trace.OtlpGrpcSpanExporter;
+
 import java.io.IOException;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
@@ -65,69 +77,93 @@ public class OpenTelemetryServer {
   /**
    * Main launches the server from the command line.
    */
-  public static void main(String[] args) throws IOException, InterruptedException {
-    // The port on which the server should run.
-    int port = 50051;
-    // The port on which prometheus metrics are exposed.
-    int prometheusPort = 9464;
+  public static void main(String[] args) {
+    try {
+      // The port on which the server should run.
+      int port = 50051;
+      // The port on which prometheus metrics are exposed.
+      int prometheusPort = 9464;
 
-    if (args.length > 0) {
-      if ("--help".equals(args[0])) {
-        System.err.println("Usage: [port [prometheus_port]]");
-        System.err.println("");
-        System.err.println("  port  The port on which server will run. Defaults to " + port);
-        System.err.println("  prometheusPort  The port to expose prometheus metrics. Defaults to " + prometheusPort);
-        System.exit(1);
-      }
-      port = Integer.parseInt(args[0]);
-    }
-    if (args.length > 1) {
-      prometheusPort = Integer.parseInt(args[1]);
-    }
-
-    // Adds a PrometheusHttpServer to convert OpenTelemetry metrics to Prometheus format and
-    // expose these via a HttpServer exporter to the SdkMeterProvider.
-    SdkMeterProvider sdkMeterProvider = SdkMeterProvider.builder()
-        .registerMetricReader(
-            PrometheusHttpServer.builder().setPort(prometheusPort).build())
-        .build();
-
-    // Initialize OpenTelemetry SDK with MeterProvider configured with Prometheus metrics exporter
-    OpenTelemetrySdk openTelemetrySdk =
-        OpenTelemetrySdk.builder().setMeterProvider(sdkMeterProvider).build();
-
-    // Initialize gRPC OpenTelemetry.
-    // Following client metrics are enabled by default :
-    //     1. grpc.server.call.started
-    //     2. grpc.server.call.sent_total_compressed_message_size
-    //     3. grpc.server.call.rcvd_total_compressed_message_size
-    //     4. grpc.server.call.duration
-    GrpcOpenTelemetry grpcOpenTelmetry = GrpcOpenTelemetry.newBuilder()
-        .sdk(openTelemetrySdk)
-        .build();
-    // Registers gRPC OpenTelemetry globally.
-    grpcOpenTelmetry.registerGlobal();
-
-    final OpenTelemetryServer server = new OpenTelemetryServer();
-    server.start(port);
-
-    Runtime.getRuntime().addShutdownHook(new Thread() {
-      @Override
-      public void run() {
-        System.err.println("*** shutting down gRPC server since JVM is shutting down");
-        try {
-          server.stop();
-        } catch (InterruptedException e) {
-          e.printStackTrace(System.err);
+      if (args.length > 0) {
+        if ("--help".equals(args[0])) {
+          System.err.println("Usage: [port [prometheus_port]]");
+          System.err.println("");
+          System.err.println("  port  The port on which server will run. Defaults to " + port);
+          System.err.println("  prometheusPort  The port to expose prometheus metrics. Defaults to " + prometheusPort);
+          System.exit(1);
         }
-        // Shut down OpenTelemetry SDK.
-        openTelemetrySdk.close();
-
-        System.err.println("*** server shut down");
+        port = Integer.parseInt(args[0]);
       }
-    });
+      if (args.length > 1) {
+        prometheusPort = Integer.parseInt(args[1]);
+      }
 
-    server.blockUntilShutdown();
+      // Adds a PrometheusHttpServer to convert OpenTelemetry metrics to Prometheus format and
+      // expose these via a HttpServer exporter to the SdkMeterProvider.
+      SdkMeterProvider sdkMeterProvider = SdkMeterProvider.builder()
+          .registerMetricReader(
+              PrometheusHttpServer.builder().setPort(prometheusPort).build())
+          .build();
+
+      // Initialize OpenTelemetry SDK with MeterProvider configured with Prometheus metrics exporter
+      // Define resource attributes (e.g., service name)
+      Resource resource = Resource.create(
+          Attributes.of(ResourceAttributes.SERVICE_NAME, "server-service")
+      );
+
+      // Configure the OTLP Span Exporter with the custom Collector endpoint
+      OtlpGrpcSpanExporter spanExporter = OtlpGrpcSpanExporter.builder()
+          .setEndpoint("http://localhost:7080") // Default OTLP gRPC port
+          .build();
+
+      SpanProcessor spanProcessor = SimpleSpanProcessor.create(spanExporter);
+
+      // Create the SdkTracerProvider
+      SdkTracerProvider sdkTracerProvider = SdkTracerProvider.builder()
+          .addSpanProcessor(spanProcessor)
+          .setResource(resource)
+          .build();
+      OpenTelemetrySdk openTelemetrySdk =
+          OpenTelemetrySdk.builder().setTracerProvider(sdkTracerProvider)
+              .setPropagators(ContextPropagators.create(TextMapPropagator.composite(
+                  GrpcTraceBinContextPropagator.defaultInstance()
+              ))).setMeterProvider(sdkMeterProvider).build();
+
+      // Initialize gRPC OpenTelemetry.
+      // Following client metrics are enabled by default :
+      //     1. grpc.server.call.started
+      //     2. grpc.server.call.sent_total_compressed_message_size
+      //     3. grpc.server.call.rcvd_total_compressed_message_size
+      //     4. grpc.server.call.duration
+      GrpcOpenTelemetry grpcOpenTelmetry = GrpcOpenTelemetry.newBuilder()
+          .sdk(openTelemetrySdk)
+          .build();
+      // Registers gRPC OpenTelemetry globally.
+      grpcOpenTelmetry.registerGlobal();
+
+      final OpenTelemetryServer server = new OpenTelemetryServer();
+      server.start(port);
+
+      Runtime.getRuntime().addShutdownHook(new Thread() {
+        @Override
+        public void run() {
+          System.err.println("*** shutting down gRPC server since JVM is shutting down");
+          try {
+            server.stop();
+          } catch (InterruptedException e) {
+            e.printStackTrace(System.err);
+          }
+          // Shut down OpenTelemetry SDK.
+          openTelemetrySdk.close();
+
+          System.err.println("*** server shut down");
+        }
+      });
+
+      server.blockUntilShutdown();
+    } catch(Throwable t) {
+      System.err.println("crash");
+    }
   }
 
   static class GreeterImpl extends GreeterGrpc.GreeterImplBase {

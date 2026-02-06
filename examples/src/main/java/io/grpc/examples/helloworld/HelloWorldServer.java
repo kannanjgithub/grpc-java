@@ -35,7 +35,7 @@ public class HelloWorldServer {
   private Server server;
   private void start() throws IOException {
     /* The port on which the server should run */
-    int port = 50051;
+    int port = 7080;
     /*
      * By default gRPC uses a global, shared Executor.newCachedThreadPool() for gRPC callbacks into
      * your application. This is convenient, but can cause an excessive number of threads to be

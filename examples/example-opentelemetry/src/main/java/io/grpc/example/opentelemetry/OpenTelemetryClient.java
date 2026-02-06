@@ -26,13 +26,24 @@ import io.grpc.examples.helloworld.GreeterGrpc;
 import io.grpc.examples.helloworld.HelloReply;
 import io.grpc.examples.helloworld.HelloRequest;
 import io.grpc.opentelemetry.GrpcOpenTelemetry;
+import io.grpc.opentelemetry.GrpcTraceBinContextPropagator;
+import io.opentelemetry.context.propagation.ContextPropagators;
+import io.opentelemetry.context.propagation.TextMapPropagator;
 import io.opentelemetry.exporter.prometheus.PrometheusHttpServer;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
+import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.sdk.metrics.SdkMeterProvider;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import io.opentelemetry.sdk.resources.Resource;
+import io.opentelemetry.sdk.trace.SdkTracerProvider;
+import io.opentelemetry.sdk.trace.SpanProcessor;
+import io.opentelemetry.sdk.trace.export.BatchSpanProcessor;
+import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
+import io.opentelemetry.semconv.ResourceAttributes;
+import io.opentelemetry.exporter.otlp.trace.OtlpGrpcSpanExporter;
 
 /**
  * A simple gRPC client that requests a greeting from the {@link HelloWorldServer} and
@@ -93,6 +104,35 @@ public class OpenTelemetryClient {
 
     Thread mainThread = Thread.currentThread();
 
+
+    // Adds a PrometheusHttpServer to convert OpenTelemetry metrics to Prometheus format and
+    // expose these via a HttpServer exporter to the SdkMeterProvider.
+    SdkMeterProvider sdkMeterProvider = SdkMeterProvider.builder()
+        .registerMetricReader(
+            PrometheusHttpServer.builder().setPort(prometheusPort).build())
+        .build();
+    Resource resource = Resource.create(
+        Attributes.of(ResourceAttributes.SERVICE_NAME, "client-service")
+    );
+
+    // Configure the OTLP Span Exporter with the custom Collector endpoint
+    OtlpGrpcSpanExporter spanExporter = OtlpGrpcSpanExporter.builder()
+        .setEndpoint("http://localhost:7080") // Default OTLP gRPC port
+        .build();
+    SpanProcessor spanProcessor = SimpleSpanProcessor.create(spanExporter);
+
+    // Create the SdkTracerProvider
+    SdkTracerProvider sdkTracerProvider = SdkTracerProvider.builder()
+        .addSpanProcessor(spanProcessor)
+        .setResource(resource)
+        .build();
+    // Initialize OpenTelemetry SDK with MeterProvider configured with Prometeheus.
+    OpenTelemetrySdk openTelemetrySdk =
+        OpenTelemetrySdk.builder().setTracerProvider(sdkTracerProvider).setMeterProvider(sdkMeterProvider)
+            .setPropagators(ContextPropagators.create(TextMapPropagator.composite(
+                GrpcTraceBinContextPropagator.defaultInstance()
+            )))
+            .build();
     Runtime.getRuntime().addShutdownHook(new Thread() {
       @Override
       public void run() {
@@ -105,20 +145,11 @@ public class OpenTelemetryClient {
         } catch (InterruptedException e) {
           e.printStackTrace(System.err);
         }
+        System.err.println("Closing the otel sdk");
+        openTelemetrySdk.close();
         System.err.println("*** client shut down");
       }
     });
-
-    // Adds a PrometheusHttpServer to convert OpenTelemetry metrics to Prometheus format and
-    // expose these via a HttpServer exporter to the SdkMeterProvider.
-    SdkMeterProvider sdkMeterProvider = SdkMeterProvider.builder()
-        .registerMetricReader(
-            PrometheusHttpServer.builder().setPort(prometheusPort).build())
-        .build();
-
-    // Initialize OpenTelemetry SDK with MeterProvider configured with Prometeheus.
-    OpenTelemetrySdk openTelemetrySdk =
-        OpenTelemetrySdk.builder().setMeterProvider(sdkMeterProvider).build();
 
     // Initialize gRPC OpenTelemetry.
     // Following client metrics are enabled by default :
@@ -148,6 +179,7 @@ public class OpenTelemetryClient {
     } finally {
       channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
       // Shut down OpenTelemetry SDK.
+      logger.log(Level.INFO, "Closing the otel sdk");
       openTelemetrySdk.close();
     }
   }
