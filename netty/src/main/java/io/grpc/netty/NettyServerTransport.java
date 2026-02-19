@@ -160,6 +160,14 @@ class NettyServerTransport implements ServerTransport {
     channel.closeFuture().addListener(terminationNotifier);
 
     channel.pipeline().addLast(bufferingHandler);
+    channel.writeAndFlush(NettyClientHandler.NOOP_MESSAGE).addListener(new ChannelFutureListener() {
+      @Override
+      public void operationComplete(ChannelFuture future) throws Exception {
+        if (!future.isSuccess()) {
+          notifyTerminated(future.cause());
+        }
+      }
+    });
   }
 
   @Override
