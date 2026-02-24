@@ -58,10 +58,15 @@ import java.net.SocketAddress;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import javax.annotation.Nullable;
+import javax.annotation.concurrent.GuardedBy;
 import javax.annotation.concurrent.ThreadSafe;
 
 /**
@@ -126,7 +131,7 @@ final class InternalSubchannel implements InternalInstrumented<ChannelStats>, Tr
   private ManagedClientTransport shutdownDueToUpdateTransport;
 
   /**
-   * All transports that are not terminated. At the very least the value of {@link #activeTransport}
+   * All transports that are not terminated. At the very least the value of {@link #activeTransports}
    * will be present, but previously used transports that still have streams or are stopping may
    * also be present.
    */
@@ -153,10 +158,11 @@ final class InternalSubchannel implements InternalInstrumented<ChannelStats>, Tr
   private ConnectionClientTransport pendingTransport;
 
   /**
-   * The transport for new outgoing requests. Non-null only in READY state.
+   * The transports for new outgoing requests and their open stream counts. Only in READY state transports will be
+   * present in this map.
    */
   @Nullable
-  private volatile ManagedClientTransport activeTransport;
+  private final LinkedHashMap<ClientTransport, Integer> activeTransports = new LinkedHashMap<>();
 
   private volatile ConnectivityStateInfo state = ConnectivityStateInfo.forNonError(IDLE);
 
@@ -209,9 +215,12 @@ final class InternalSubchannel implements InternalInstrumented<ChannelStats>, Tr
 
   @Override
   public ClientTransport obtainActiveTransport() {
-    ClientTransport savedTransport = activeTransport;
-    if (savedTransport != null) {
-      return savedTransport;
+    synchronized(this) {
+      ClientTransport activeTransport = getTransport();
+      if (activeTransport != null) {
+        activeTransports.put(activeTransport, activeTransports.get(activeTransport) + 1);
+        return activeTransport;
+      }
     }
     syncContext.execute(new Runnable() {
       @Override
@@ -230,8 +239,16 @@ final class InternalSubchannel implements InternalInstrumented<ChannelStats>, Tr
    * Returns a READY transport if there is any, without trying to connect.
    */
   @Nullable
-  ClientTransport getTransport() {
-    return activeTransport;
+  synchronized ClientTransport getTransport() {
+    Iterator<Map.Entry<ClientTransport, Integer>> iterator = activeTransports.entrySet().iterator();
+    while (iterator.hasNext()) {
+      Map.Entry<ClientTransport, Integer> transportAndStreamCount = iterator.next();
+      // TODO: get the stream limit via settings
+      if (transportAndStreamCount.getValue() < 0) {
+        return transportAndStreamCount.getKey();
+      }
+    }
+    return null;
   }
 
   /**
@@ -384,8 +401,8 @@ final class InternalSubchannel implements InternalInstrumented<ChannelStats>, Tr
           if (!addressIndex.seekTo(previousAddress)) {
             // Forced to drop the connection
             if (state.getState() == READY) {
-              savedTransport = activeTransport;
-              activeTransport = null;
+              savedTransport = activeTransports;
+              activeTransports = null;
               addressIndex.reset();
               gotoNonErrorState(IDLE);
             } else {
@@ -441,9 +458,9 @@ final class InternalSubchannel implements InternalInstrumented<ChannelStats>, Tr
           return;
         }
         shutdownReason = reason;
-        savedActiveTransport = activeTransport;
+        savedActiveTransport = activeTransports;
         savedPendingTransport = pendingTransport;
-        activeTransport = null;
+        activeTransports = null;
         pendingTransport = null;
         gotoNonErrorState(SHUTDOWN);
         addressIndex.reset();
@@ -594,11 +611,11 @@ final class InternalSubchannel implements InternalInstrumented<ChannelStats>, Tr
           reconnectPolicy = null;
           if (shutdownReason != null) {
             // activeTransport should have already been set to null by shutdown(). We keep it null.
-            Preconditions.checkState(activeTransport == null,
+            Preconditions.checkState(activeTransports == null,
                 "Unexpected non-null activeTransport");
             transport.shutdown(shutdownReason);
           } else if (pendingTransport == transport) {
-            activeTransport = transport;
+            activeTransports = transport;
             pendingTransport = null;
             connectedAddressAttributes = addressIndex.getCurrentEagAttributes();
             gotoNonErrorState(READY);
@@ -630,8 +647,8 @@ final class InternalSubchannel implements InternalInstrumented<ChannelStats>, Tr
           if (state.getState() == SHUTDOWN) {
             return;
           }
-          if (activeTransport == transport) {
-            activeTransport = null;
+          if (activeTransports == transport) {
+            activeTransports = null;
             addressIndex.reset();
             gotoNonErrorState(IDLE);
             subchannelMetrics.recordDisconnection(/* target= */ target,
