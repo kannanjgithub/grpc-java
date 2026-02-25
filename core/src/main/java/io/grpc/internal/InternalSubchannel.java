@@ -647,8 +647,8 @@ final class InternalSubchannel implements InternalInstrumented<ChannelStats>, Tr
           if (state.getState() == SHUTDOWN) {
             return;
           }
-          if (activeTransports == transport) {
-            activeTransports = null;
+          if (activeTransports.containsKey(transport)) {
+            activeTransports.remove(transport);
             addressIndex.reset();
             gotoNonErrorState(IDLE);
             subchannelMetrics.recordDisconnection(/* target= */ target,
