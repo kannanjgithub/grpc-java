@@ -68,7 +68,7 @@ import io.grpc.testing.GrpcCleanupRule;
 import io.grpc.util.MutableHandlerRegistry;
 import io.grpc.xds.ExternalProcessorFilter.ExternalProcessorFilterConfig;
 import io.grpc.xds.ExternalProcessorFilter.ExternalProcessorFilterOverrideConfig;
-import io.grpc.xds.ExternalProcessorFilter.ExternalProcessorInterceptor;
+import io.grpc.xds.ExternalProcessorInterceptor;
 import io.grpc.xds.client.Bootstrapper;
 import io.grpc.xds.client.EnvoyProtoData.Node;
 import io.grpc.xds.internal.grpcservice.CachedChannelManager;

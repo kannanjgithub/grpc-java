@@ -64,6 +64,7 @@ import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
 import io.grpc.MetricInstrumentRegistry;
 import io.grpc.MetricRecorder;
+import io.grpc.ServerInterceptor;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.internal.DelayedClientCall;
@@ -224,6 +225,11 @@ public class ExternalProcessorFilter implements Filter {
     }
 
     @Override
+    public boolean isServerFilter() {
+      return true;
+    }
+
+    @Override
     public ExternalProcessorFilter newInstance(FilterContext context) {
       return new ExternalProcessorFilter(context);
     }
@@ -274,6 +280,20 @@ public class ExternalProcessorFilter implements Filter {
     }
     return new ExternalProcessorInterceptor(
         extProcFilterConfig, cachedChannelManager, scheduler, context);
+  }
+
+  @Nullable
+  @Override
+  public ServerInterceptor buildServerInterceptor(FilterConfig filterConfig,
+      @Nullable FilterConfig overrideConfig) {
+    ExternalProcessorFilterConfig extProcFilterConfig =
+        (ExternalProcessorFilterConfig) filterConfig;
+    if (overrideConfig != null) {
+      extProcFilterConfig = mergeConfigs(extProcFilterConfig,
+          (ExternalProcessorFilterOverrideConfig) overrideConfig);
+    }
+    return new ExternalProcessorServerInterceptor(
+        extProcFilterConfig, cachedChannelManager, context);
   }
 
   private static ExternalProcessorFilterConfig mergeConfigs(
