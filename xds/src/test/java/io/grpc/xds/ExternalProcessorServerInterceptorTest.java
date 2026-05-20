@@ -67,6 +67,7 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.Before;
 import org.junit.Rule;
@@ -327,5 +328,114 @@ public class ExternalProcessorServerInterceptorTest {
     interceptor.interceptCall(dummyCall, new Metadata(), dummyNext);
 
     assertThat(callStarted.get()).isTrue();
+  }
+
+  @Test
+  public void serverInterceptor_concurrency_serializesDelegateCallbacks() throws Exception {
+    ExternalProcessor proto = createBaseProto(extProcServerName).build();
+    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
+        provider.parseFilterConfig(Any.pack(proto), filterContext);
+    assertThat(configOrError.errorDetail).isNull();
+    ExternalProcessorFilterConfig filterConfig = configOrError.config;
+
+    final AtomicReference<StreamObserver<ProcessingResponse>> responseObserverRef = new AtomicReference<>();
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          public StreamObserver<ProcessingRequest> process(
+              StreamObserver<ProcessingResponse> responseObserver) {
+            responseObserverRef.set(responseObserver);
+            return new StreamObserver<ProcessingRequest>() {
+              @Override public void onNext(ProcessingRequest request) {}
+              @Override public void onError(Throwable t) {}
+              @Override public void onCompleted() {}
+            };
+          }
+        };
+
+    grpcCleanup.register(InProcessServerBuilder.forName(extProcServerName)
+        .addService(extProcImpl)
+        .directExecutor()
+        .build().start());
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(extProcServerName)
+              .directExecutor()
+              .build());
+    });
+
+    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
+        filterConfig, channelManager, FAKE_CONTEXT);
+
+    ServerCall<InputStream, InputStream> dummyCall = new ServerCall<InputStream, InputStream>() {
+      @Override public void request(int numMessages) {}
+      @Override public void sendHeaders(Metadata headers) {}
+      @Override public void sendMessage(InputStream message) {}
+      @Override public void close(Status status, Metadata trailers) {}
+      @Override public boolean isCancelled() { return false; }
+      @Override public MethodDescriptor<InputStream, InputStream> getMethodDescriptor() {
+        return METHOD_SAY_HELLO_RAW;
+      }
+    };
+
+    final AtomicInteger concurrentCalls = new AtomicInteger(0);
+    final AtomicBoolean raceDetected = new AtomicBoolean(false);
+    final int ITERATIONS = 1000;
+
+    ServerCall.Listener<InputStream> delegateListener = new ServerCall.Listener<InputStream>() {
+      @Override
+      public void onMessage(InputStream message) {
+        int current = concurrentCalls.incrementAndGet();
+        if (current > 1) {
+          raceDetected.set(true);
+        }
+        try {
+          Thread.sleep(1);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        }
+        concurrentCalls.decrementAndGet();
+      }
+    };
+
+    ServerCallHandler<InputStream, InputStream> dummyNext = new ServerCallHandler<InputStream, InputStream>() {
+      @Override
+      public ServerCall.Listener<InputStream> startCall(ServerCall<InputStream, InputStream> call, Metadata headers) {
+        return delegateListener;
+      }
+    };
+
+    @SuppressWarnings("unchecked")
+    ExternalProcessorServerInterceptor.DataPlaneServerListener serverListener =
+        (ExternalProcessorServerInterceptor.DataPlaneServerListener)
+            interceptor.interceptCall(dummyCall, new Metadata(), dummyNext);
+
+    // Simulate that the call is active and pass-through mode is enabled for quick delegate execution
+    serverListener.setDelegate(delegateListener);
+
+    Thread threadA = new Thread(() -> {
+      for (int i = 0; i < ITERATIONS; i++) {
+        serverListener.onMessage(new ByteArrayInputStream(new byte[0]));
+      }
+    });
+
+    Thread threadB = new Thread(() -> {
+      for (int i = 0; i < ITERATIONS; i++) {
+        serverListener.onExternalBody(ByteString.EMPTY);
+      }
+    });
+
+    threadA.start();
+    threadB.start();
+    threadA.join();
+    threadB.join();
+
+    StreamObserver<ProcessingResponse> responseObserver = responseObserverRef.get();
+    if (responseObserver != null) {
+      responseObserver.onCompleted();
+    }
+
+    assertThat(raceDetected.get()).isFalse();
   }
 }

@@ -59,6 +59,7 @@ import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.internal.GrpcUtil;
 import io.grpc.internal.SharedResourceHolder;
+import io.grpc.internal.SerializingExecutor;
 import io.grpc.stub.ClientCallStreamObserver;
 import io.grpc.stub.ClientResponseObserver;
 import io.grpc.stub.MetadataUtils;
@@ -301,6 +302,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     private final ServerCall<InputStream, InputStream> rawCall;
     private final ExternalProcessorGrpc.ExternalProcessorStub stub;
+    private final SerializingExecutor delegateExecutor;
     private final ExternalProcessorFilterConfig config;
     private final ScheduledExecutorService scheduler;
     private final Object streamLock = new Object();
@@ -352,7 +354,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
         Metadata requestHeaders) {
       super(rawCall);
       this.rawCall = rawCall;
-      this.stub = stub;
+      this.delegateExecutor = new SerializingExecutor(com.google.common.util.concurrent.MoreExecutors.directExecutor());
+      this.stub = stub.withExecutor(this.delegateExecutor);
       this.config = config;
       this.currentProcessingMode = config.getExternalProcessor().getProcessingMode();
       this.mutationFilter = new HeaderMutationFilter(mutationRulesConfig);
@@ -1081,7 +1084,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     }
   }
 
-  private static class DataPlaneServerListener extends ServerCall.Listener<InputStream> {
+  static class DataPlaneServerListener extends ServerCall.Listener<InputStream> {
     private final DataPlaneServerCall dataPlaneServerCall;
     private final Queue<InputStream> savedMessages = new ConcurrentLinkedQueue<>();
     private volatile boolean halfCloseReceived;
@@ -1092,20 +1095,24 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     }
 
     void setDelegate(ServerCall.Listener<InputStream> delegate) {
-      this.delegate = delegate;
-      InputStream msg;
-      while ((msg = savedMessages.poll()) != null) {
-        delegate.onMessage(msg);
-      }
-      if (halfCloseReceived) {
-        delegate.onHalfClose();
-      }
+      dataPlaneServerCall.delegateExecutor.execute(() -> {
+        this.delegate = delegate;
+        InputStream msg;
+        while ((msg = savedMessages.poll()) != null) {
+          delegate.onMessage(msg);
+        }
+        if (halfCloseReceived) {
+          delegate.onHalfClose();
+        }
+      });
     }
 
     @Override
     public void onReady() {
-      dataPlaneServerCall.drainPendingRequests();
-      onReadyNotify();
+      dataPlaneServerCall.delegateExecutor.execute(() -> {
+        dataPlaneServerCall.drainPendingRequests();
+        onReadyNotify();
+      });
     }
 
     void onReadyNotify() {
@@ -1117,59 +1124,63 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     @Override
     public void onMessage(InputStream message) {
-      ServerCall.Listener<InputStream> del = delegate;
-      if (dataPlaneServerCall.passThroughMode.get() && del != null) {
-        del.onMessage(message);
-        return;
-      }
-
-      if (dataPlaneServerCall.dataPlaneCallState.get() == DataPlaneCallState.IDLE) {
-        savedMessages.add(message);
-        return;
-      }
-
-      if (dataPlaneServerCall.isExtProcStreamCompleted()
-          || dataPlaneServerCall.currentProcessingMode.getRequestBodyMode()
-              != ProcessingMode.BodySendMode.GRPC) {
-        if (del != null) {
+      dataPlaneServerCall.delegateExecutor.execute(() -> {
+        ServerCall.Listener<InputStream> del = delegate;
+        if (dataPlaneServerCall.passThroughMode.get() && del != null) {
           del.onMessage(message);
+          return;
         }
-        return;
-      }
 
-      try {
-        byte[] bodyBytes = ByteStreams.toByteArray(message);
-        sendRequestBodyToExtProc(bodyBytes, false);
-
-        if (dataPlaneServerCall.config.getObservabilityMode() && del != null) {
-          del.onMessage(new ByteArrayInputStream(bodyBytes));
+        if (dataPlaneServerCall.dataPlaneCallState.get() == DataPlaneCallState.IDLE) {
+          savedMessages.add(message);
+          return;
         }
-      } catch (IOException e) {
-        dataPlaneServerCall.rawCall.close(Status.INTERNAL.withDescription("Failed to read client request").withCause(e), new Metadata());
-      }
+
+        if (dataPlaneServerCall.isExtProcStreamCompleted()
+            || dataPlaneServerCall.currentProcessingMode.getRequestBodyMode()
+                != ProcessingMode.BodySendMode.GRPC) {
+          if (del != null) {
+            del.onMessage(message);
+          }
+          return;
+        }
+
+        try {
+          byte[] bodyBytes = ByteStreams.toByteArray(message);
+          sendRequestBodyToExtProc(bodyBytes, false);
+
+          if (dataPlaneServerCall.config.getObservabilityMode() && del != null) {
+            del.onMessage(new ByteArrayInputStream(bodyBytes));
+          }
+        } catch (IOException e) {
+          dataPlaneServerCall.rawCall.close(Status.INTERNAL.withDescription("Failed to read client request").withCause(e), new Metadata());
+        }
+      });
     }
 
     @Override
     public void onHalfClose() {
-      dataPlaneServerCall.clientHalfCloseStartNanos = System.nanoTime();
-      dataPlaneServerCall.halfClosed.set(true);
-      ServerCall.Listener<InputStream> del = delegate;
-      if ((dataPlaneServerCall.passThroughMode.get() || dataPlaneServerCall.isExtProcStreamCompleted()) && del != null) {
-        proceedWithHalfClose();
-        return;
-      }
+      dataPlaneServerCall.delegateExecutor.execute(() -> {
+        dataPlaneServerCall.clientHalfCloseStartNanos = System.nanoTime();
+        dataPlaneServerCall.halfClosed.set(true);
+        ServerCall.Listener<InputStream> del = delegate;
+        if ((dataPlaneServerCall.passThroughMode.get() || dataPlaneServerCall.isExtProcStreamCompleted()) && del != null) {
+          proceedWithHalfClose();
+          return;
+        }
 
-      if (dataPlaneServerCall.dataPlaneCallState.get() == DataPlaneCallState.IDLE) {
-        halfCloseReceived = true;
-        return;
-      }
+        if (dataPlaneServerCall.dataPlaneCallState.get() == DataPlaneCallState.IDLE) {
+          halfCloseReceived = true;
+          return;
+        }
 
-      if (dataPlaneServerCall.currentProcessingMode.getRequestBodyMode() == ProcessingMode.BodySendMode.NONE) {
-        proceedWithHalfClose();
-        return;
-      }
+        if (dataPlaneServerCall.currentProcessingMode.getRequestBodyMode() == ProcessingMode.BodySendMode.NONE) {
+          proceedWithHalfClose();
+          return;
+        }
 
-      sendRequestBodyToExtProc(null, true);
+        sendRequestBodyToExtProc(null, true);
+      });
     }
 
     void proceedWithHalfClose() {
@@ -1211,18 +1222,22 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     @Override
     public void onCancel() {
-      ServerCall.Listener<InputStream> del = delegate;
-      if (del != null) {
-        del.onCancel();
-      }
+      dataPlaneServerCall.delegateExecutor.execute(() -> {
+        ServerCall.Listener<InputStream> del = delegate;
+        if (del != null) {
+          del.onCancel();
+        }
+      });
     }
 
     @Override
     public void onComplete() {
-      ServerCall.Listener<InputStream> del = delegate;
-      if (del != null) {
-        del.onComplete();
-      }
+      dataPlaneServerCall.delegateExecutor.execute(() -> {
+        ServerCall.Listener<InputStream> del = delegate;
+        if (del != null) {
+          del.onComplete();
+        }
+      });
     }
   }
 }
