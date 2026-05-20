@@ -58,7 +58,6 @@ import io.grpc.ServerInterceptor;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.internal.GrpcUtil;
-import io.grpc.internal.SerializingExecutor;
 import io.grpc.internal.SharedResourceHolder;
 import io.grpc.stub.ClientCallStreamObserver;
 import io.grpc.stub.ClientResponseObserver;
@@ -119,12 +118,9 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
         (ServerCallHandler<InputStream, InputStream>) (ServerCallHandler<?, ?>) next;
 
     ScheduledExecutorService scheduler = SharedResourceHolder.get(GrpcUtil.TIMER_SERVICE);
-    SerializingExecutor serializingExecutor =
-        new SerializingExecutor(com.google.common.util.concurrent.MoreExecutors.directExecutor());
-
     ExternalProcessorGrpc.ExternalProcessorStub extProcStub = ExternalProcessorGrpc.newStub(
         cachedChannelManager.getChannel(filterConfig.getGrpcServiceConfig()))
-        .withExecutor(serializingExecutor);
+        .withExecutor(com.google.common.util.concurrent.MoreExecutors.directExecutor());
 
     if (filterConfig.getGrpcServiceConfig().timeout().isPresent()) {
       long timeoutNanos = filterConfig.getGrpcServiceConfig().timeout().get().toNanos();
@@ -310,7 +306,6 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     private final Object streamLock = new Object();
     private final Queue<EventType> expectedResponses = new ConcurrentLinkedQueue<>();
     private volatile ClientCallStreamObserver<ProcessingRequest> extProcClientCallRequestObserver;
-    private final Queue<ProcessingRequest> pendingProcessingRequests = new ConcurrentLinkedQueue<>();
     private final Queue<InputStream> pendingDrainingMessages = new ConcurrentLinkedQueue<>();
     private final Queue<InputStream> savedOutgoingMessages = new ConcurrentLinkedQueue<>();
     private volatile DataPlaneServerListener wrappedListener;
@@ -513,9 +508,6 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
         public void beforeStart(ClientCallStreamObserver<ProcessingRequest> requestStream) {
           synchronized (streamLock) {
             extProcClientCallRequestObserver = requestStream;
-            while (!pendingProcessingRequests.isEmpty()) {
-              requestStream.onNext(pendingProcessingRequests.poll());
-            }
           }
           requestStream.setOnReadyHandler(DataPlaneServerCall.this::onExtProcStreamReady);
         }
@@ -690,11 +682,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
           expectedResponses.add(EventType.RESPONSE_TRAILERS);
         }
 
-        if (extProcClientCallRequestObserver != null) {
-          extProcClientCallRequestObserver.onNext(request);
-        } else {
-          pendingProcessingRequests.add(request);
-        }
+        extProcClientCallRequestObserver.onNext(request);
       }
     }
 
