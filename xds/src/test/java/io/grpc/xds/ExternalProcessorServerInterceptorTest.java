@@ -69,6 +69,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.nio.charset.StandardCharsets;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
@@ -437,5 +438,108 @@ public class ExternalProcessorServerInterceptorTest {
     }
 
     assertThat(raceDetected.get()).isFalse();
+  }
+
+  @Test
+  public void serverInterceptor_grpcBodyMode_dispatchesMessageToExtProcImmediatelyDuringIdle() throws Exception {
+    // Configure GRPC request body mode
+    ExternalProcessor proto = createBaseProto(extProcServerName)
+        .setProcessingMode(ProcessingMode.newBuilder()
+            .setRequestBodyMode(ProcessingMode.BodySendMode.GRPC)
+            .build())
+        .build();
+    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
+        provider.parseFilterConfig(Any.pack(proto), filterContext);
+    assertThat(configOrError.errorDetail).isNull();
+    ExternalProcessorFilterConfig filterConfig = configOrError.config;
+
+    final AtomicReference<ProcessingRequest> receivedRequestRef = new AtomicReference<>();
+    final AtomicReference<StreamObserver<ProcessingResponse>> responseObserverRef = new AtomicReference<>();
+    final CountDownLatch requestLatch = new CountDownLatch(2); // Expect 1 for headers, 1 for body
+
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          public StreamObserver<ProcessingRequest> process(
+              StreamObserver<ProcessingResponse> responseObserver) {
+            responseObserverRef.set(responseObserver);
+            return new StreamObserver<ProcessingRequest>() {
+              @Override
+              public void onNext(ProcessingRequest request) {
+                if (request.hasRequestBody()) {
+                  receivedRequestRef.set(request);
+                }
+                requestLatch.countDown();
+              }
+              @Override public void onError(Throwable t) {}
+              @Override public void onCompleted() {}
+            };
+          }
+        };
+
+    grpcCleanup.register(InProcessServerBuilder.forName(extProcServerName)
+        .addService(extProcImpl)
+        .directExecutor()
+        .build().start());
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(extProcServerName)
+              .directExecutor()
+              .build());
+    });
+
+    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
+        filterConfig, channelManager, FAKE_CONTEXT);
+
+    ServerCall<InputStream, InputStream> dummyCall = new ServerCall<InputStream, InputStream>() {
+      @Override public void request(int numMessages) {}
+      @Override public void sendHeaders(Metadata headers) {}
+      @Override public void sendMessage(InputStream message) {}
+      @Override public void close(Status status, Metadata trailers) {}
+      @Override public boolean isCancelled() { return false; }
+      @Override public MethodDescriptor<InputStream, InputStream> getMethodDescriptor() {
+        return METHOD_SAY_HELLO_RAW;
+      }
+    };
+
+    final AtomicBoolean startCallCalled = new AtomicBoolean();
+    ServerCallHandler<InputStream, InputStream> dummyNext = new ServerCallHandler<InputStream, InputStream>() {
+      @Override
+      public ServerCall.Listener<InputStream> startCall(ServerCall<InputStream, InputStream> call, Metadata headers) {
+        startCallCalled.set(true);
+        return new ServerCall.Listener<InputStream>() {};
+      }
+    };
+
+    @SuppressWarnings("unchecked")
+    ExternalProcessorServerInterceptor.DataPlaneServerListener serverListener =
+        (ExternalProcessorServerInterceptor.DataPlaneServerListener)
+            interceptor.interceptCall(dummyCall, new Metadata(), dummyNext);
+
+    // Invocate onMessage() while the call is IDLE (headers response has not been sent)
+    byte[] messageBytes = "hello".getBytes(StandardCharsets.UTF_8);
+    serverListener.onMessage(new ByteArrayInputStream(messageBytes));
+
+    // Wait and verify that the external processor immediately receives both the headers request and the body request
+    boolean receivedInTime = requestLatch.await(5, TimeUnit.SECONDS);
+    assertThat(receivedInTime).isTrue();
+
+    ProcessingRequest receivedRequest = receivedRequestRef.get();
+    assertThat(receivedRequest).isNotNull();
+    assertThat(receivedRequest.hasRequestBody()).isTrue();
+    assertThat(receivedRequest.getRequestBody().getBody().toStringUtf8()).isEqualTo("hello");
+
+    // Assert that the data plane call was not started yet
+    assertThat(startCallCalled.get()).isFalse();
+
+    // Clean up control stream to release gRPC channels cleanly
+    StreamObserver<ProcessingResponse> responseObserver = responseObserverRef.get();
+    if (responseObserver != null) {
+      responseObserver.onCompleted();
+    }
+
+    // After control stream completes, it should trigger fail-open/fallback activation of the data plane call
+    assertThat(startCallCalled.get()).isTrue();
   }
 }

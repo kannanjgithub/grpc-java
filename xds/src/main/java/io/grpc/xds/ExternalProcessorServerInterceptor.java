@@ -1131,29 +1131,30 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
           return;
         }
 
-        if (dataPlaneServerCall.dataPlaneCallState.get() == DataPlaneCallState.IDLE) {
-          savedMessages.add(message);
-          return;
-        }
-
+        // If control stream is finished, or request body processing is disabled,
+        // or observability mode is enabled (which ignores mutations):
         if (dataPlaneServerCall.isExtProcStreamCompleted()
             || dataPlaneServerCall.currentProcessingMode.getRequestBodyMode()
-                != ProcessingMode.BodySendMode.GRPC) {
-          if (del != null) {
+                != ProcessingMode.BodySendMode.GRPC
+            || dataPlaneServerCall.config.getObservabilityMode()) {
+
+          if (dataPlaneServerCall.dataPlaneCallState.get() == DataPlaneCallState.IDLE) {
+            // We must buffer because the application call hasn't started yet
+            savedMessages.add(message);
+          } else if (del != null) {
             del.onMessage(message);
           }
           return;
         }
 
+        // Mode is GRPC and not in observability mode: dispatch immediately to ext_proc!
         try {
           byte[] bodyBytes = ByteStreams.toByteArray(message);
           sendRequestBodyToExtProc(bodyBytes, false);
-
-          if (dataPlaneServerCall.config.getObservabilityMode() && del != null) {
-            del.onMessage(new ByteArrayInputStream(bodyBytes));
-          }
         } catch (IOException e) {
-          dataPlaneServerCall.rawCall.close(Status.INTERNAL.withDescription("Failed to read client request").withCause(e), new Metadata());
+          dataPlaneServerCall.rawCall.close(
+              Status.INTERNAL.withDescription("Failed to read client request").withCause(e),
+              new Metadata());
         }
       });
     }
