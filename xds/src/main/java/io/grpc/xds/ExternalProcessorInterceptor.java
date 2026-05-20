@@ -564,6 +564,10 @@ final class ExternalProcessorInterceptor implements ClientInterceptor {
         @Override
         public void onNext(ProcessingResponse response) {
           try {
+            if (config.getObservabilityMode()) {
+              return;
+            }
+
             if (response.hasImmediateResponse()) {
               if (config.getDisableImmediateResponse()) {
                 internalOnError(Status.UNAVAILABLE
@@ -573,10 +577,6 @@ final class ExternalProcessorInterceptor implements ClientInterceptor {
                 return;
               }
               handleImmediateResponse(response.getImmediateResponse(), wrappedListener);
-              return;
-            }
-
-            if (config.getObservabilityMode()) {
               return;
             }
 

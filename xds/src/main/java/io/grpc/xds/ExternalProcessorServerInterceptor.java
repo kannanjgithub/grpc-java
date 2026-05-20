@@ -500,7 +500,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       mutator.applyMutations(filteredMutations, metadata);
     }
 
-    public void start() {
+    void start() {
       clientHeadersStartNanos = System.nanoTime();
 
       stub.process(new ClientResponseObserver<ProcessingRequest, ProcessingResponse>() {
@@ -515,6 +515,10 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
         @Override
         public void onNext(ProcessingResponse response) {
           try {
+            if (config.getObservabilityMode()) {
+              return;
+            }
+
             if (response.hasImmediateResponse()) {
               if (config.getDisableImmediateResponse()) {
                 internalOnError(Status.UNAVAILABLE
@@ -524,10 +528,6 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
                 return;
               }
               handleImmediateResponse(response.getImmediateResponse());
-              return;
-            }
-
-            if (config.getObservabilityMode()) {
               return;
             }
 
