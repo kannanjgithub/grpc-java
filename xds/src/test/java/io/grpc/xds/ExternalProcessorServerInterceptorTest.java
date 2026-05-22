@@ -542,4 +542,224 @@ public class ExternalProcessorServerInterceptorTest {
     // After control stream completes, it should trigger fail-open/fallback activation of the data plane call
     assertThat(startCallCalled.get()).isTrue();
   }
+
+  @Test
+  public void serverInterceptor_outboundStreamTermination_serializesSendMessage() throws Exception {
+    // Configure response body mode to GRPC
+    ExternalProcessor proto = createBaseProto(extProcServerName)
+        .setFailureModeAllow(true)
+        .setProcessingMode(ProcessingMode.newBuilder()
+            .setResponseBodyMode(ProcessingMode.BodySendMode.GRPC)
+            .build())
+        .build();
+    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
+        provider.parseFilterConfig(Any.pack(proto), filterContext);
+    assertThat(configOrError.errorDetail).isNull();
+    ExternalProcessorFilterConfig filterConfig = configOrError.config;
+
+    final AtomicReference<StreamObserver<ProcessingResponse>> responseObserverRef = new AtomicReference<>();
+    final CountDownLatch streamActiveLatch = new CountDownLatch(1);
+
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          public StreamObserver<ProcessingRequest> process(
+              StreamObserver<ProcessingResponse> responseObserver) {
+            responseObserverRef.set(responseObserver);
+            streamActiveLatch.countDown();
+            return new StreamObserver<ProcessingRequest>() {
+              @Override public void onNext(ProcessingRequest request) {}
+              @Override public void onError(Throwable t) {}
+              @Override public void onCompleted() {}
+            };
+          }
+        };
+
+    grpcCleanup.register(InProcessServerBuilder.forName(extProcServerName)
+        .addService(extProcImpl)
+        .directExecutor()
+        .build().start());
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(extProcServerName)
+              .directExecutor()
+              .build());
+    });
+
+    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
+        filterConfig, channelManager, FAKE_CONTEXT);
+
+    final AtomicInteger activeSendMessageCalls = new AtomicInteger(0);
+    final AtomicBoolean concurrentCallDetected = new AtomicBoolean(false);
+    final CountDownLatch messageSentLatch = new CountDownLatch(2);
+
+    ServerCall<InputStream, InputStream> mockCall = new ServerCall<InputStream, InputStream>() {
+      @Override public void request(int numMessages) {}
+      @Override public void sendHeaders(Metadata headers) {}
+      @Override public void sendMessage(InputStream message) {
+        int active = activeSendMessageCalls.incrementAndGet();
+        if (active > 1) {
+          concurrentCallDetected.set(true);
+        }
+        try {
+          // Small sleep to encourage overlap if not serialized
+          Thread.sleep(50);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        }
+        activeSendMessageCalls.decrementAndGet();
+        messageSentLatch.countDown();
+      }
+      @Override public void close(Status status, Metadata trailers) {}
+      @Override public boolean isCancelled() { return false; }
+      @Override public MethodDescriptor<InputStream, InputStream> getMethodDescriptor() {
+        return METHOD_SAY_HELLO_RAW;
+      }
+    };
+
+    final AtomicReference<ServerCall<InputStream, InputStream>> wrappedCallRef = new AtomicReference<>();
+    ServerCallHandler<InputStream, InputStream> dummyNext = new ServerCallHandler<InputStream, InputStream>() {
+      @Override
+      public ServerCall.Listener<InputStream> startCall(ServerCall<InputStream, InputStream> call, Metadata headers) {
+        wrappedCallRef.set(call);
+        return new ServerCall.Listener<InputStream>() {};
+      }
+    };
+
+    interceptor.interceptCall(mockCall, new Metadata(), dummyNext);
+
+    // Complete headers processing to activate the call
+    boolean active = streamActiveLatch.await(5, TimeUnit.SECONDS);
+    assertThat(active).isTrue();
+
+    StreamObserver<ProcessingResponse> responseObserver = responseObserverRef.get();
+    responseObserver.onNext(ProcessingResponse.newBuilder()
+        .setRequestHeaders(HeadersResponse.newBuilder()
+            .setResponse(CommonResponse.newBuilder().build())
+            .build())
+        .build());
+
+    // Wait for startCall to be invoked and capture the wrapped call
+    ServerCall<InputStream, InputStream> wrappedCall = wrappedCallRef.get();
+    assertThat(wrappedCall).isNotNull();
+
+    // Trigger stream failure on the control plane to initiate fail-open / draining
+    responseObserver.onError(new RuntimeException("Stream dropped"));
+
+    // Launch thread to concurrently send outbound messages via the application thread and the control plane draining thread
+    Thread appThread = new Thread(() -> {
+      wrappedCall.sendMessage(new ByteArrayInputStream("app-msg".getBytes(StandardCharsets.UTF_8)));
+    });
+
+    // Wait for the control stream to fail and queue the pending messages, then execute both concurrently
+    wrappedCall.sendMessage(new ByteArrayInputStream("buffered-msg".getBytes(StandardCharsets.UTF_8)));
+
+    appThread.start();
+    appThread.join();
+
+    boolean sent = messageSentLatch.await(5, TimeUnit.SECONDS);
+    assertThat(sent).isTrue();
+    assertThat(concurrentCallDetected.get()).isFalse();
+  }
+
+  @Test
+  public void serverInterceptor_concurrentSendHeadersAndFailOpen_flushesHeadersCorrectly() throws Exception {
+    ExternalProcessor proto = createBaseProto(extProcServerName).build();
+    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
+        provider.parseFilterConfig(Any.pack(proto), filterContext);
+    assertThat(configOrError.errorDetail).isNull();
+    ExternalProcessorFilterConfig filterConfig = configOrError.config;
+
+    final AtomicReference<StreamObserver<ProcessingResponse>> responseObserverRef = new AtomicReference<>();
+    final CountDownLatch streamActiveLatch = new CountDownLatch(1);
+
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          public StreamObserver<ProcessingRequest> process(
+              StreamObserver<ProcessingResponse> responseObserver) {
+            responseObserverRef.set(responseObserver);
+            streamActiveLatch.countDown();
+            return new StreamObserver<ProcessingRequest>() {
+              @Override public void onNext(ProcessingRequest request) {}
+              @Override public void onError(Throwable t) {}
+              @Override public void onCompleted() {}
+            };
+          }
+        };
+
+    grpcCleanup.register(InProcessServerBuilder.forName(extProcServerName)
+        .addService(extProcImpl)
+        .directExecutor()
+        .build().start());
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(extProcServerName)
+              .directExecutor()
+              .build());
+    });
+
+    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
+        filterConfig, channelManager, FAKE_CONTEXT);
+
+    final CountDownLatch headersSentLatch = new CountDownLatch(1);
+    final AtomicReference<Metadata> receivedHeadersRef = new AtomicReference<>();
+
+    ServerCall<InputStream, InputStream> mockCall = new ServerCall<InputStream, InputStream>() {
+      @Override public void request(int numMessages) {}
+      @Override public void sendHeaders(Metadata headers) {
+        receivedHeadersRef.set(headers);
+        headersSentLatch.countDown();
+      }
+      @Override public void sendMessage(InputStream message) {}
+      @Override public void close(Status status, Metadata trailers) {}
+      @Override public boolean isCancelled() { return false; }
+      @Override public MethodDescriptor<InputStream, InputStream> getMethodDescriptor() {
+        return METHOD_SAY_HELLO_RAW;
+      }
+    };
+
+    final AtomicReference<ServerCall<InputStream, InputStream>> wrappedCallRef = new AtomicReference<>();
+    ServerCallHandler<InputStream, InputStream> dummyNext = new ServerCallHandler<InputStream, InputStream>() {
+      @Override
+      public ServerCall.Listener<InputStream> startCall(ServerCall<InputStream, InputStream> call, Metadata headers) {
+        wrappedCallRef.set(call);
+        return new ServerCall.Listener<InputStream>() {};
+      }
+    };
+
+    interceptor.interceptCall(mockCall, new Metadata(), dummyNext);
+
+    boolean active = streamActiveLatch.await(5, TimeUnit.SECONDS);
+    assertThat(active).isTrue();
+
+    StreamObserver<ProcessingResponse> responseObserver = responseObserverRef.get();
+    responseObserver.onNext(ProcessingResponse.newBuilder()
+        .setRequestHeaders(HeadersResponse.newBuilder()
+            .setResponse(CommonResponse.newBuilder().build())
+            .build())
+        .build());
+
+    ServerCall<InputStream, InputStream> wrappedCall = wrappedCallRef.get();
+    assertThat(wrappedCall).isNotNull();
+
+    Thread appThread = new Thread(() -> {
+      Metadata headers = new Metadata();
+      headers.put(Metadata.Key.of("x-resp-header", Metadata.ASCII_STRING_MARSHALLER), "val");
+      wrappedCall.sendHeaders(headers);
+    });
+
+    appThread.start();
+    // Concurrently fail the control plane stream to trigger fail-open / proceedWithSendHeaders()
+    responseObserver.onError(new RuntimeException("Stream failure"));
+
+    appThread.join();
+
+    boolean headersSent = headersSentLatch.await(5, TimeUnit.SECONDS);
+    assertThat(headersSent).isTrue();
+    assertThat(receivedHeadersRef.get().get(
+        Metadata.Key.of("x-resp-header", Metadata.ASCII_STRING_MARSHALLER))).isEqualTo("val");
+  }
 }

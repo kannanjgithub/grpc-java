@@ -306,6 +306,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     private final ExternalProcessorFilterConfig config;
     private final ScheduledExecutorService scheduler;
     private final Object streamLock = new Object();
+    private final Object rawCallLock = new Object();
     private final Queue<EventType> expectedResponses = new ConcurrentLinkedQueue<>();
     private volatile ClientCallStreamObserver<ProcessingRequest> extProcClientCallRequestObserver;
     private final Queue<InputStream> pendingDrainingMessages = new ConcurrentLinkedQueue<>();
@@ -791,12 +792,17 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
           || currentProcessingMode.getResponseHeaderMode()
               == ProcessingMode.HeaderSendMode.DEFAULT;
 
-      if (passThroughMode.get() || isExtProcStreamCompleted() || !sendResponseHeaders) {
-        proceedWithSendHeaders(headers);
-        return;
+      synchronized (rawCallLock) {
+        // NOTE: Even if sendResponseHeaders is false, we MUST obtain rawCallLock to call
+        // proceedWithSendHeaders() safely, because an active control plane thread could
+        // concurrently call super.sendMessage() or super.close() (e.g., due to a concurrent error).
+        if (passThroughMode.get() || isExtProcStreamCompleted() || !sendResponseHeaders) {
+          proceedWithSendHeaders(headers);
+          return;
+        }
+        this.savedResponseHeaders = headers;
       }
 
-      this.savedResponseHeaders = headers;
       sendToExtProc(ProcessingRequest.newBuilder()
           .setResponseHeaders(HttpHeaders.newBuilder()
               .setHeaders(toHeaderMap(headers, config.getForwardRulesConfig()))
@@ -804,20 +810,24 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
           .build());
 
       if (config.getObservabilityMode()) {
-        proceedWithSendHeaders();
+        synchronized (rawCallLock) {
+          proceedWithSendHeaders();
+        }
       }
     }
 
     void proceedWithSendHeaders() {
-      if (savedResponseHeaders != null) {
-        proceedWithSendHeaders(savedResponseHeaders);
-        savedResponseHeaders = null;
-        InputStream msg;
-        while ((msg = savedOutgoingMessages.poll()) != null) {
-          sendMessage(msg);
-        }
-        if (savedStatus != null) {
-          triggerCloseHandshake();
+      synchronized (rawCallLock) {
+        if (savedResponseHeaders != null) {
+          proceedWithSendHeaders(savedResponseHeaders);
+          savedResponseHeaders = null;
+          InputStream msg;
+          while ((msg = savedOutgoingMessages.poll()) != null) {
+            sendMessage(msg);
+          }
+          if (savedStatus != null) {
+            triggerCloseHandshake();
+          }
         }
       }
     }
@@ -837,22 +847,26 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
         return;
       }
 
-      if (passThroughMode.get()) {
-        super.sendMessage(message);
-        return;
-      }
-
-      if (savedResponseHeaders != null) {
-        savedOutgoingMessages.add(message);
-        return;
-      }
-
-      synchronized (streamLock) {
+      // Acquire rawCallLock to safely inspect passThroughMode and state
+      synchronized (rawCallLock) {
         if (passThroughMode.get()) {
           super.sendMessage(message);
           return;
         }
 
+        // NOTE: Both checks below must reside inside the synchronized(rawCallLock) block to
+        // prevent a Check-Then-Act race condition. If they were checked lock-free, a context
+        // switch immediately after the check but before adding to the queue would allow a
+        // concurrent control plane thread to finish draining first. The resuming thread would
+        // then insert the message into a queue that will never be drained again, causing a hung call.
+
+        // Check-Then-Act: Atomically verify headers sending state and queue message
+        if (savedResponseHeaders != null) {
+          savedOutgoingMessages.add(message);
+          return;
+        }
+
+        // Check-Then-Act: Atomically verify stream draining state and queue message
         if (isExtProcStreamDraining() || isExtProcStreamCompleted()) {
           pendingDrainingMessages.add(message);
           return;
@@ -860,7 +874,9 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       }
 
       if (currentProcessingMode.getResponseBodyMode() == ProcessingMode.BodySendMode.NONE) {
-        super.sendMessage(message);
+        synchronized (rawCallLock) {
+          super.sendMessage(message);
+        }
         return;
       }
 
@@ -869,7 +885,9 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
         sendResponseBodyToExtProc(bodyBytes, false);
 
         if (config.getObservabilityMode()) {
-          super.sendMessage(new ByteArrayInputStream(bodyBytes));
+          synchronized (rawCallLock) {
+            super.sendMessage(new ByteArrayInputStream(bodyBytes));
+          }
         }
       } catch (IOException e) {
         rawCall.close(Status.INTERNAL.withDescription("Failed to serialize response body").withCause(e), new Metadata());
@@ -885,29 +903,34 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
         }
         return;
       }
-      if (passThroughMode.get()) {
-        if (markDataPlaneCallClosed()) {
-          proceedWithClose(status, trailers);
+
+      synchronized (rawCallLock) {
+        if (passThroughMode.get()) {
+          if (markDataPlaneCallClosed()) {
+            proceedWithClose(status, trailers);
+          }
+          return;
         }
-        return;
-      }
 
-      this.savedStatus = status;
-      this.savedTrailers = trailers;
+        this.savedStatus = status;
+        this.savedTrailers = trailers;
 
-      if (isExtProcStreamCompleted()) {
-        proceedWithClose();
-        return;
-      }
+        if (isExtProcStreamCompleted()) {
+          proceedWithClose();
+          return;
+        }
 
-      if (savedResponseHeaders != null) {
-        return;
+        if (savedResponseHeaders != null) {
+          return;
+        }
       }
 
       triggerCloseHandshake();
 
       if (config.getObservabilityMode()) {
-        proceedWithClose();
+        synchronized (rawCallLock) {
+          proceedWithClose();
+        }
         @SuppressWarnings("unused")
         ScheduledFuture<?> unused = scheduler.schedule(
             this::closeExtProcStream,
@@ -917,12 +940,14 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     }
 
     void proceedWithClose() {
-      if (savedStatus != null) {
-        if (markDataPlaneCallClosed()) {
-          proceedWithClose(savedStatus, savedTrailers);
+      synchronized (rawCallLock) {
+        if (savedStatus != null) {
+          if (markDataPlaneCallClosed()) {
+            proceedWithClose(savedStatus, savedTrailers);
+          }
+          savedStatus = null;
+          savedTrailers = null;
         }
-        savedStatus = null;
-        savedTrailers = null;
       }
     }
 
@@ -1037,7 +1062,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     }
 
     private void drainPendingDrainingMessages() {
-      synchronized (streamLock) {
+      synchronized (rawCallLock) {
         passThroughMode.set(true);
         InputStream msg;
         while ((msg = pendingDrainingMessages.poll()) != null) {
