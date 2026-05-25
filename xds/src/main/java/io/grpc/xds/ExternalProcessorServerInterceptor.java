@@ -905,6 +905,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
           if (markDataPlaneCallClosed()) {
             proceedWithClose(status, trailers);
           }
+          closeExtProcStream();
           return;
         }
 
