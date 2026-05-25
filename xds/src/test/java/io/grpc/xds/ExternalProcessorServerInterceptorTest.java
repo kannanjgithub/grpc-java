@@ -25,6 +25,7 @@ import com.google.protobuf.ByteString;
 import io.envoyproxy.envoy.config.core.v3.GrpcService;
 import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor;
 import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ProcessingMode;
+import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.HeaderForwardingRules;
 import io.envoyproxy.envoy.service.ext_proc.v3.BodyMutation;
 import io.envoyproxy.envoy.service.ext_proc.v3.BodyResponse;
 import io.envoyproxy.envoy.service.ext_proc.v3.CommonResponse;
@@ -74,6 +75,7 @@ import io.grpc.NameResolverProvider;
 import io.grpc.NameResolverRegistry;
 import java.net.SocketAddress;
 import java.net.URI;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
@@ -2273,8 +2275,433 @@ public class ExternalProcessorServerInterceptorTest {
   // ============================================================================
 
   // ============================================================================
-  // Category 14: Header Forwarding Rules [SKIPPED]
+  // Category 14: Header Forwarding Rules
   // ============================================================================
+
+  @Test
+  public void serverInterceptor_allowedHeaders_whenHeadersForwarded_thenOnlyAllowedAreSent()
+      throws Exception {
+    final AtomicReference<io.envoyproxy.envoy.service.ext_proc.v3.HttpHeaders> capturedHeaders =
+        new AtomicReference<>();
+    final CountDownLatch sidecarLatch = new CountDownLatch(1);
+
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          @SuppressWarnings("unchecked")
+          public StreamObserver<ProcessingRequest> process(
+              StreamObserver<ProcessingResponse> responseObserver) {
+            ((ServerCallStreamObserver<ProcessingResponse>) responseObserver).request(100);
+            return new StreamObserver<ProcessingRequest>() {
+              @Override
+              public void onNext(ProcessingRequest request) {
+                if (request.hasRequestHeaders()) {
+                  capturedHeaders.set(request.getRequestHeaders());
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setRequestHeaders(HeadersResponse.newBuilder().build())
+                      .build());
+                  sidecarLatch.countDown();
+                } else if (request.hasResponseHeaders()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setResponseHeaders(HeadersResponse.newBuilder().build())
+                      .build());
+                } else if (request.hasRequestBody()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setRequestBody(io.envoyproxy.envoy.service.ext_proc.v3.BodyResponse.newBuilder().build())
+                      .build());
+                } else if (request.hasResponseBody()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setResponseBody(io.envoyproxy.envoy.service.ext_proc.v3.BodyResponse.newBuilder().build())
+                      .build());
+                } else if (request.hasRequestTrailers()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setRequestTrailers(io.envoyproxy.envoy.service.ext_proc.v3.TrailersResponse.newBuilder().build())
+                      .build());
+                } else if (request.hasResponseTrailers()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setResponseTrailers(io.envoyproxy.envoy.service.ext_proc.v3.TrailersResponse.newBuilder().build())
+                      .build());
+                }
+              }
+              @Override public void onError(Throwable t) {}
+              @Override public void onCompleted() {}
+            };
+          }
+        };
+
+    grpcCleanup.register(InProcessServerBuilder.forName(extProcServerName)
+        .addService(extProcImpl)
+        .directExecutor()
+        .build().start());
+
+    // Config with forward_rules and explicit processing mode:
+    // allowed_headers = ["x-allowed-*", "content-type"], requestHeaderMode = SEND, others = SKIP
+    ExternalProcessor proto = createBaseProto(extProcServerName)
+        .setProcessingMode(ProcessingMode.newBuilder()
+            .setRequestHeaderMode(ProcessingMode.HeaderSendMode.SEND)
+            .setResponseHeaderMode(ProcessingMode.HeaderSendMode.SKIP)
+            .setResponseTrailerMode(ProcessingMode.HeaderSendMode.SKIP)
+            .build())
+        .setForwardRules(HeaderForwardingRules.newBuilder()
+            .setAllowedHeaders(
+                io.envoyproxy.envoy.type.matcher.v3.ListStringMatcher.newBuilder()
+                    .addPatterns(
+                        io.envoyproxy.envoy.type.matcher.v3.StringMatcher.newBuilder()
+                            .setPrefix("x-allowed-")
+                            .build())
+                    .addPatterns(
+                        io.envoyproxy.envoy.type.matcher.v3.StringMatcher.newBuilder()
+                            .setExact("content-type")
+                            .build())
+                    .build())
+            .build())
+        .build();
+
+    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
+        provider.parseFilterConfig(Any.pack(proto), filterContext);
+    assertThat(configOrError.errorDetail).isNull();
+    ExternalProcessorFilterConfig filterConfig = configOrError.config;
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(extProcServerName)
+              .directExecutor()
+              .build());
+    });
+
+    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
+        filterConfig, channelManager, FAKE_CONTEXT);
+
+    dataPlaneHandler = new DataPlaneServiceHandler() {
+      @Override
+      public void sayHello(InputStream request, StreamObserver<InputStream> responseObserver) {
+        responseObserver.onNext(request);
+        responseObserver.onCompleted();
+      }
+    };
+
+    startDataPlane(interceptor);
+
+    io.grpc.ClientCall<InputStream, InputStream> clientCall = dataPlaneChannel.newCall(
+        METHOD_SAY_HELLO_RAW, io.grpc.CallOptions.DEFAULT);
+
+    final CountDownLatch callCompletedLatch = new CountDownLatch(1);
+    final AtomicReference<Status> callStatus = new AtomicReference<>();
+    Metadata headers = new Metadata();
+    headers.put(Metadata.Key.of("x-allowed-1", Metadata.ASCII_STRING_MARSHALLER), "v1");
+    headers.put(Metadata.Key.of("x-disallowed", Metadata.ASCII_STRING_MARSHALLER), "v2");
+    headers.put(Metadata.Key.of("content-type", Metadata.ASCII_STRING_MARSHALLER), "application/grpc");
+
+    clientCall.start(new io.grpc.ClientCall.Listener<InputStream>() {
+      @Override
+      public void onClose(Status status, Metadata trailers) {
+        System.out.println("--- Client onClose: " + status + " ---");
+        callStatus.set(status);
+        callCompletedLatch.countDown();
+      }
+    }, headers);
+
+    clientCall.request(1);
+    clientCall.sendMessage(new ByteArrayInputStream("hello".getBytes(StandardCharsets.UTF_8)));
+    clientCall.halfClose();
+
+    boolean sidecarAwaited = sidecarLatch.await(5, TimeUnit.SECONDS);
+    System.out.println("--- sidecarAwaited: " + sidecarAwaited + " ---");
+    boolean completedAwaited = callCompletedLatch.await(5, TimeUnit.SECONDS);
+    System.out.println("--- completedAwaited: " + completedAwaited + " ---");
+    System.out.println("--- callStatus: " + callStatus.get() + " ---");
+
+    assertThat(sidecarAwaited).isTrue();
+    assertThat(completedAwaited).isTrue();
+    assertThat(callStatus.get().isOk()).isTrue();
+
+    List<String> headerKeys = new ArrayList<>();
+    for (io.envoyproxy.envoy.config.core.v3.HeaderValue hv :
+        capturedHeaders.get().getHeaders().getHeadersList()) {
+      headerKeys.add(hv.getKey());
+    }
+
+    assertThat(headerKeys).contains("x-allowed-1");
+    assertThat(headerKeys).contains("content-type");
+    assertThat(headerKeys).doesNotContain("x-disallowed");
+  }
+
+  @Test
+  public void serverInterceptor_disallowedHeaders_whenHeadersForwarded_thenSkipped()
+      throws Exception {
+    final AtomicReference<io.envoyproxy.envoy.service.ext_proc.v3.HttpHeaders> capturedHeaders =
+        new AtomicReference<>();
+    final CountDownLatch sidecarLatch = new CountDownLatch(1);
+
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          @SuppressWarnings("unchecked")
+          public StreamObserver<ProcessingRequest> process(
+              StreamObserver<ProcessingResponse> responseObserver) {
+            ((ServerCallStreamObserver<ProcessingResponse>) responseObserver).request(100);
+            return new StreamObserver<ProcessingRequest>() {
+              @Override
+              public void onNext(ProcessingRequest request) {
+                if (request.hasRequestHeaders()) {
+                  capturedHeaders.set(request.getRequestHeaders());
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setRequestHeaders(HeadersResponse.newBuilder().build())
+                      .build());
+                  sidecarLatch.countDown();
+                } else if (request.hasResponseHeaders()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setResponseHeaders(HeadersResponse.newBuilder().build())
+                      .build());
+                } else if (request.hasRequestBody()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setRequestBody(io.envoyproxy.envoy.service.ext_proc.v3.BodyResponse.newBuilder().build())
+                      .build());
+                } else if (request.hasResponseBody()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setResponseBody(io.envoyproxy.envoy.service.ext_proc.v3.BodyResponse.newBuilder().build())
+                      .build());
+                } else if (request.hasRequestTrailers()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setRequestTrailers(io.envoyproxy.envoy.service.ext_proc.v3.TrailersResponse.newBuilder().build())
+                      .build());
+                } else if (request.hasResponseTrailers()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setResponseTrailers(io.envoyproxy.envoy.service.ext_proc.v3.TrailersResponse.newBuilder().build())
+                      .build());
+                }
+              }
+              @Override public void onError(Throwable t) {}
+              @Override public void onCompleted() {}
+            };
+          }
+        };
+
+    grpcCleanup.register(InProcessServerBuilder.forName(extProcServerName)
+        .addService(extProcImpl)
+        .directExecutor()
+        .build().start());
+
+    // Config with forward_rules and explicit processing mode: requestHeaderMode = SEND, others = SKIP
+    ExternalProcessor proto = createBaseProto(extProcServerName)
+        .setProcessingMode(ProcessingMode.newBuilder()
+            .setRequestHeaderMode(ProcessingMode.HeaderSendMode.SEND)
+            .setResponseHeaderMode(ProcessingMode.HeaderSendMode.SKIP)
+            .setResponseTrailerMode(ProcessingMode.HeaderSendMode.SKIP)
+            .build())
+        .setForwardRules(HeaderForwardingRules.newBuilder()
+            .setDisallowedHeaders(
+                io.envoyproxy.envoy.type.matcher.v3.ListStringMatcher.newBuilder()
+                    .addPatterns(
+                        io.envoyproxy.envoy.type.matcher.v3.StringMatcher.newBuilder()
+                            .setExact("x-secret")
+                            .build())
+                    .addPatterns(
+                        io.envoyproxy.envoy.type.matcher.v3.StringMatcher.newBuilder()
+                            .setExact("authorization")
+                            .build())
+                    .build())
+            .build())
+        .build();
+
+    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
+        provider.parseFilterConfig(Any.pack(proto), filterContext);
+    assertThat(configOrError.errorDetail).isNull();
+    ExternalProcessorFilterConfig filterConfig = configOrError.config;
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(extProcServerName)
+              .directExecutor()
+              .build());
+    });
+
+    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
+        filterConfig, channelManager, FAKE_CONTEXT);
+
+    dataPlaneHandler = new DataPlaneServiceHandler() {
+      @Override
+      public void sayHello(InputStream request, StreamObserver<InputStream> responseObserver) {
+        responseObserver.onNext(request);
+        responseObserver.onCompleted();
+      }
+    };
+
+    startDataPlane(interceptor);
+
+    io.grpc.ClientCall<InputStream, InputStream> clientCall = dataPlaneChannel.newCall(
+        METHOD_SAY_HELLO_RAW, io.grpc.CallOptions.DEFAULT);
+
+    final CountDownLatch callCompletedLatch = new CountDownLatch(1);
+    Metadata headers = new Metadata();
+    headers.put(Metadata.Key.of("x-foo", Metadata.ASCII_STRING_MARSHALLER), "v1");
+    headers.put(Metadata.Key.of("x-secret", Metadata.ASCII_STRING_MARSHALLER), "v2");
+    headers.put(Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER), "v3");
+
+    clientCall.start(new io.grpc.ClientCall.Listener<InputStream>() {
+      @Override
+      public void onClose(Status status, Metadata trailers) {
+        callCompletedLatch.countDown();
+      }
+    }, headers);
+
+    clientCall.request(1);
+    clientCall.sendMessage(new ByteArrayInputStream("hello".getBytes(StandardCharsets.UTF_8)));
+    clientCall.halfClose();
+
+    assertThat(sidecarLatch.await(5, TimeUnit.SECONDS)).isTrue();
+    assertThat(callCompletedLatch.await(5, TimeUnit.SECONDS)).isTrue();
+
+    List<String> headerKeys = new ArrayList<>();
+    for (io.envoyproxy.envoy.config.core.v3.HeaderValue hv :
+        capturedHeaders.get().getHeaders().getHeadersList()) {
+      headerKeys.add(hv.getKey());
+    }
+
+    assertThat(headerKeys).contains("x-foo");
+    assertThat(headerKeys).doesNotContain("x-secret");
+    assertThat(headerKeys).doesNotContain("authorization");
+  }
+
+  @Test
+  public void serverInterceptor_bothRules_whenHeadersForwarded_thenBothAreApplied()
+      throws Exception {
+    final AtomicReference<io.envoyproxy.envoy.service.ext_proc.v3.HttpHeaders> capturedHeaders =
+        new AtomicReference<>();
+    final CountDownLatch sidecarLatch = new CountDownLatch(1);
+
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          @SuppressWarnings("unchecked")
+          public StreamObserver<ProcessingRequest> process(
+              StreamObserver<ProcessingResponse> responseObserver) {
+            ((ServerCallStreamObserver<ProcessingResponse>) responseObserver).request(100);
+            return new StreamObserver<ProcessingRequest>() {
+              @Override
+              public void onNext(ProcessingRequest request) {
+                if (request.hasRequestHeaders()) {
+                  capturedHeaders.set(request.getRequestHeaders());
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setRequestHeaders(HeadersResponse.newBuilder().build())
+                      .build());
+                  sidecarLatch.countDown();
+                } else if (request.hasResponseHeaders()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setResponseHeaders(HeadersResponse.newBuilder().build())
+                      .build());
+                } else if (request.hasRequestBody()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setRequestBody(io.envoyproxy.envoy.service.ext_proc.v3.BodyResponse.newBuilder().build())
+                      .build());
+                } else if (request.hasResponseBody()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setResponseBody(io.envoyproxy.envoy.service.ext_proc.v3.BodyResponse.newBuilder().build())
+                      .build());
+                } else if (request.hasRequestTrailers()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setRequestTrailers(io.envoyproxy.envoy.service.ext_proc.v3.TrailersResponse.newBuilder().build())
+                      .build());
+                } else if (request.hasResponseTrailers()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setResponseTrailers(io.envoyproxy.envoy.service.ext_proc.v3.TrailersResponse.newBuilder().build())
+                      .build());
+                }
+              }
+              @Override public void onError(Throwable t) {}
+              @Override public void onCompleted() {}
+            };
+          }
+        };
+
+    grpcCleanup.register(InProcessServerBuilder.forName(extProcServerName)
+        .addService(extProcImpl)
+        .directExecutor()
+        .build().start());
+
+    // Config with forward_rules and explicit processing mode: requestHeaderMode = SEND, others = SKIP
+    ExternalProcessor proto = createBaseProto(extProcServerName)
+        .setProcessingMode(ProcessingMode.newBuilder()
+            .setRequestHeaderMode(ProcessingMode.HeaderSendMode.SEND)
+            .setResponseHeaderMode(ProcessingMode.HeaderSendMode.SKIP)
+            .setResponseTrailerMode(ProcessingMode.HeaderSendMode.SKIP)
+            .build())
+        .setForwardRules(HeaderForwardingRules.newBuilder()
+            .setAllowedHeaders(
+                io.envoyproxy.envoy.type.matcher.v3.ListStringMatcher.newBuilder()
+                    .addPatterns(
+                        io.envoyproxy.envoy.type.matcher.v3.StringMatcher.newBuilder()
+                            .setPrefix("x-foo-")
+                            .build())
+                    .build())
+            .setDisallowedHeaders(
+                io.envoyproxy.envoy.type.matcher.v3.ListStringMatcher.newBuilder()
+                    .addPatterns(
+                        io.envoyproxy.envoy.type.matcher.v3.StringMatcher.newBuilder()
+                            .setExact("x-foo-secret")
+                            .build())
+                    .build())
+            .build())
+        .build();
+
+    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
+        provider.parseFilterConfig(Any.pack(proto), filterContext);
+    assertThat(configOrError.errorDetail).isNull();
+    ExternalProcessorFilterConfig filterConfig = configOrError.config;
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(extProcServerName)
+              .directExecutor()
+              .build());
+    });
+
+    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
+        filterConfig, channelManager, FAKE_CONTEXT);
+
+    dataPlaneHandler = new DataPlaneServiceHandler() {
+      @Override
+      public void sayHello(InputStream request, StreamObserver<InputStream> responseObserver) {
+        responseObserver.onNext(request);
+        responseObserver.onCompleted();
+      }
+    };
+
+    startDataPlane(interceptor);
+
+    io.grpc.ClientCall<InputStream, InputStream> clientCall = dataPlaneChannel.newCall(
+        METHOD_SAY_HELLO_RAW, io.grpc.CallOptions.DEFAULT);
+
+    final CountDownLatch callCompletedLatch = new CountDownLatch(1);
+    Metadata headers = new Metadata();
+    headers.put(Metadata.Key.of("x-foo-1", Metadata.ASCII_STRING_MARSHALLER), "v1");
+    headers.put(Metadata.Key.of("x-foo-secret", Metadata.ASCII_STRING_MARSHALLER), "v2");
+    headers.put(Metadata.Key.of("x-bar", Metadata.ASCII_STRING_MARSHALLER), "v3");
+
+    clientCall.start(new io.grpc.ClientCall.Listener<InputStream>() {
+      @Override
+      public void onClose(Status status, Metadata trailers) {
+        callCompletedLatch.countDown();
+      }
+    }, headers);
+
+    clientCall.request(1);
+    clientCall.sendMessage(new ByteArrayInputStream("hello".getBytes(StandardCharsets.UTF_8)));
+    clientCall.halfClose();
+
+    assertThat(sidecarLatch.await(5, TimeUnit.SECONDS)).isTrue();
+    assertThat(callCompletedLatch.await(5, TimeUnit.SECONDS)).isTrue();
+
+    List<String> headerKeys = new ArrayList<>();
+    for (io.envoyproxy.envoy.config.core.v3.HeaderValue hv :
+        capturedHeaders.get().getHeaders().getHeadersList()) {
+      headerKeys.add(hv.getKey());
+    }
+
+    assertThat(headerKeys).contains("x-foo-1");
+    assertThat(headerKeys).doesNotContain("x-foo-secret");
+    assertThat(headerKeys).doesNotContain("x-bar");
+  }
 
   // ============================================================================
   // Category 15: Request Attributes [SKIPPED]
