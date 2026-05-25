@@ -80,7 +80,6 @@ import io.grpc.xds.internal.Matchers;
 import io.grpc.xds.internal.grpcservice.CachedChannelManager;
 import io.grpc.xds.internal.grpcservice.GrpcServiceConfig;
 import io.grpc.xds.internal.grpcservice.GrpcServiceParseException;
-import io.grpc.xds.internal.grpcservice.HeaderValue;
 import io.grpc.xds.internal.headermutations.HeaderMutationDisallowedException;
 import io.grpc.xds.internal.headermutations.HeaderMutationFilter;
 import io.grpc.xds.internal.headermutations.HeaderMutationRulesConfig;
