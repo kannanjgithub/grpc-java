@@ -694,6 +694,20 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       }
     }
 
+    private void cancelExtProcStream(Throwable t) {
+      if (markExtProcStreamFailed()) {
+        synchronized (streamLock) {
+          if (extProcClientCallRequestObserver != null) {
+            try {
+              extProcClientCallRequestObserver.onError(t);
+            } catch (Throwable ignored) {
+            }
+            extProcClientCallRequestObserver = null;
+          }
+        }
+      }
+    }
+
     private void internalOnError(Throwable t) {
       if (markExtProcStreamFailed()) {
         synchronized (streamLock) {
@@ -1231,6 +1245,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     @Override
     public void onCancel() {
       dataPlaneServerCall.delegateExecutor.execute(() -> {
+        dataPlaneServerCall.cancelExtProcStream(
+            Status.CANCELLED.withDescription("Client cancelled RPC").asRuntimeException());
         ServerCall.Listener<InputStream> del = delegate;
         if (del != null) {
           del.onCancel();

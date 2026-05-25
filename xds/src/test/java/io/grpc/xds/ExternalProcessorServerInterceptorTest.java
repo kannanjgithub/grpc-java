@@ -83,6 +83,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.nio.charset.StandardCharsets;
+import org.mockito.Mockito;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
@@ -1894,12 +1895,97 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 10: Resource Management [SKIPPED]
+  // Category 10: Resource Management
   // ============================================================================
 
+  @Test
+  public void givenFilter_whenClosed_thenCachedChannelManagerIsClosed() throws Exception {
+    CachedChannelManager mockChannelManager = Mockito.mock(CachedChannelManager.class);
+    ExternalProcessorFilter filter = new ExternalProcessorFilter(FAKE_CONTEXT, mockChannelManager);
+    filter.close();
+    Mockito.verify(mockChannelManager).close();
+  }
+
   // ============================================================================
-  // Category 11: Data plane rpc cancellation [SKIPPED]
+  // Category 11: Data plane rpc cancellation
   // ============================================================================
+
+  @Test
+  @SuppressWarnings("unchecked")
+  public void givenActiveRpc_whenDataPlaneCallCancelled_thenExtProcStreamIsErrored()
+      throws Exception {
+    String uniqueExtProcServerName = InProcessServerBuilder.generateName();
+    ExternalProcessor proto = ExternalProcessor.newBuilder()
+        .setGrpcService(GrpcService.newBuilder()
+            .setGoogleGrpc(GrpcService.GoogleGrpc.newBuilder()
+                .setTargetUri("in-process:///" + uniqueExtProcServerName)
+                .addChannelCredentialsPlugin(Any.newBuilder()
+                    .setTypeUrl("type.googleapis.com/envoy.extensions.grpc_service." 
+                        + "channel_credentials.insecure.v3.InsecureCredentials")
+                    .build())
+                .build())
+            .build())
+        .build();
+    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
+        provider.parseFilterConfig(Any.pack(proto), filterContext);
+    assertThat(configOrError.errorDetail).isNull();
+    ExternalProcessorFilterConfig filterConfig = configOrError.config;
+
+    final CountDownLatch cancelLatch = new CountDownLatch(1);
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          @SuppressWarnings("unchecked")
+          public StreamObserver<ProcessingRequest> process(
+              final StreamObserver<ProcessingResponse> responseObserver) {
+            ((ServerCallStreamObserver<ProcessingResponse>) responseObserver).request(100);
+            return new StreamObserver<ProcessingRequest>() {
+              @Override public void onNext(ProcessingRequest request) {}
+
+              @Override
+              public void onError(Throwable t) {
+                cancelLatch.countDown();
+              }
+
+              @Override public void onCompleted() {}
+            };
+          }
+        };
+    grpcCleanup.register(InProcessServerBuilder.forName(uniqueExtProcServerName)
+        .addService(extProcImpl)
+        .directExecutor()
+        .build().start());
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(uniqueExtProcServerName).directExecutor().build());
+    });
+
+    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
+        filterConfig, channelManager, FAKE_CONTEXT);
+
+    final AtomicReference<ServerCall.Listener<InputStream>> interceptedListenerRef = new AtomicReference<>();
+    ServerCallHandler<InputStream, InputStream> nextHandler = (call, headers) -> {
+      ServerCall.Listener<InputStream> listener = new ServerCall.Listener<InputStream>() {};
+      interceptedListenerRef.set(listener);
+      return listener;
+    };
+
+    ServerCall<InputStream, InputStream> rawCall = new SimpleServerCall(METHOD_SAY_HELLO_RAW);
+
+    try {
+      ServerCall.Listener<InputStream> listener =
+          interceptor.interceptCall(rawCall, new Metadata(), nextHandler);
+
+      // Client cancels the RPC
+      listener.onCancel();
+
+      // Verify sidecar control stream also received onError/cancellation
+      assertThat(cancelLatch.await(5, TimeUnit.SECONDS)).isTrue();
+    } finally {
+      channelManager.close();
+    }
+  }
 
   // ============================================================================
   // Category 12: Flow Control when side stream is full [SKIPPED]
