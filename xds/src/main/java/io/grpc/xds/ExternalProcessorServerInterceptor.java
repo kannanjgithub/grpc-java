@@ -109,6 +109,11 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     this.metricsRecorder = checkNotNull(context.metricsRecorder(), "metricsRecorder");
   }
 
+  ExternalProcessorFilterConfig getFilterConfig() {
+    return filterConfig;
+  }
+
+
   @Override
   @SuppressWarnings("unchecked")
   public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(

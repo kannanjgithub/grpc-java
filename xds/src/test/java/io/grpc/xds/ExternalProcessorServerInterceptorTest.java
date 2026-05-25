@@ -56,6 +56,8 @@ import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
 import io.grpc.testing.GrpcCleanupRule;
 import io.grpc.xds.ExternalProcessorFilter.ExternalProcessorFilterConfig;
+import io.grpc.xds.ExternalProcessorFilter.ExternalProcessorFilterOverrideConfig;
+
 import io.grpc.xds.Filter.FilterContext;
 import io.grpc.xds.client.Bootstrapper;
 import io.grpc.xds.client.EnvoyProtoData.Node;
@@ -304,8 +306,56 @@ public class ExternalProcessorServerInterceptorTest {
 
 
   // ============================================================================
-  // Category 2: Configuration Override [SKIPPED]
+  // Category 2: Configuration Override
   // ============================================================================
+
+  @Test
+  public void givenOverrideConfig_whenGrpcServiceOverridden_thenUsesNewService() throws Exception {
+    ExternalProcessor parentProto = createBaseProto(extProcServerName)
+        .setGrpcService(GrpcService.newBuilder()
+            .setGoogleGrpc(GrpcService.GoogleGrpc.newBuilder()
+                .setTargetUri("in-process:///parent")
+                .addChannelCredentialsPlugin(Any.newBuilder()
+                    .setTypeUrl("type.googleapis.com/envoy.extensions.grpc_service." 
+                        + "channel_credentials.insecure.v3.InsecureCredentials")
+                    .build())
+                .build())
+            .build())
+        .build();
+    
+    GrpcService overrideService = GrpcService.newBuilder()
+        .setGoogleGrpc(GrpcService.GoogleGrpc.newBuilder()
+            .setTargetUri("in-process:///override")
+            .addChannelCredentialsPlugin(Any.newBuilder()
+                .setTypeUrl("type.googleapis.com/envoy.extensions.grpc_service." 
+                    + "channel_credentials.insecure.v3.InsecureCredentials")
+                .build())
+            .build())
+        .build();
+    io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute perRoute =
+        io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute.newBuilder()
+            .setOverrides(io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ExtProcOverrides.newBuilder()
+                .setGrpcService(overrideService)
+                .build())
+            .build();
+
+    ConfigOrError<ExternalProcessorFilterConfig> parentResult = 
+        provider.parseFilterConfig(Any.pack(parentProto), filterContext);
+    assertThat(parentResult.errorDetail).isNull();
+    ExternalProcessorFilterConfig parentConfig = parentResult.config;
+    ConfigOrError<ExternalProcessorFilterOverrideConfig> overrideResult = 
+        provider.parseFilterConfigOverride(Any.pack(perRoute), filterContext);
+    assertThat(overrideResult.errorDetail).isNull();
+    ExternalProcessorFilterOverrideConfig overrideConfig = overrideResult.config;
+
+    ExternalProcessorFilter filter = new ExternalProcessorFilter(FAKE_CONTEXT);
+    ExternalProcessorServerInterceptor interceptor = (ExternalProcessorServerInterceptor)
+        filter.buildServerInterceptor(parentConfig, overrideConfig);
+
+    assertThat(interceptor.getFilterConfig().getExternalProcessor().getGrpcService()
+        .getGoogleGrpc().getTargetUri()).isEqualTo("in-process:///override");
+  }
+
 
   // ============================================================================
   // Category 3: Server Interceptor & Lifecycle [SKIPPED]
