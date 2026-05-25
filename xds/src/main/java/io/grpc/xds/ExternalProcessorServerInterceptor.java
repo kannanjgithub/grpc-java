@@ -301,7 +301,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     }
 
     private final ServerCall<InputStream, InputStream> rawCall;
-    private final ExternalProcessorGrpc.ExternalProcessorStub stub;
+    private final ExternalProcessorGrpc.ExternalProcessorStub extProcStub;
     private final SerializingExecutor delegateExecutor;
     private final ExternalProcessorFilterConfig config;
     private final ScheduledExecutorService scheduler;
@@ -344,7 +344,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     protected DataPlaneServerCall(
         ServerCall<InputStream, InputStream> rawCall,
-        ExternalProcessorGrpc.ExternalProcessorStub stub,
+        ExternalProcessorGrpc.ExternalProcessorStub extProcStub,
         ExternalProcessorFilterConfig config,
         Optional<HeaderMutationRulesConfig> mutationRulesConfig,
         ScheduledExecutorService scheduler,
@@ -356,7 +356,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       super(rawCall);
       this.rawCall = rawCall;
       this.delegateExecutor = new SerializingExecutor(com.google.common.util.concurrent.MoreExecutors.directExecutor());
-      this.stub = stub.withExecutor(this.delegateExecutor);
+      this.extProcStub = extProcStub.withExecutor(this.delegateExecutor);
       this.config = config;
       this.currentProcessingMode = config.getExternalProcessor().getProcessingMode();
       this.mutationFilter = new HeaderMutationFilter(mutationRulesConfig);
@@ -369,7 +369,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       this.wrappedListener = new DataPlaneServerListener(this);
     }
 
-    DataPlaneServerListener getListener() {
+    ServerCall.Listener<InputStream> getListener() {
       return wrappedListener;
     }
 
@@ -507,7 +507,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     void start() {
       clientHeadersStartNanos = System.nanoTime();
 
-      stub.process(new ClientResponseObserver<ProcessingRequest, ProcessingResponse>() {
+      extProcStub.process(new ClientResponseObserver<ProcessingRequest, ProcessingResponse>() {
         @Override
         public void beforeStart(ClientCallStreamObserver<ProcessingRequest> requestStream) {
           synchronized (streamLock) {
@@ -1109,13 +1109,13 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     }
   }
 
-  static class DataPlaneServerListener extends ServerCall.Listener<InputStream> {
+  private static final class DataPlaneServerListener extends ServerCall.Listener<InputStream> {
     private final DataPlaneServerCall dataPlaneServerCall;
     private final Queue<InputStream> savedMessages = new ConcurrentLinkedQueue<>();
     private volatile boolean halfCloseReceived;
     private volatile ServerCall.Listener<InputStream> delegate;
 
-    protected DataPlaneServerListener(DataPlaneServerCall dataPlaneServerCall) {
+    private DataPlaneServerListener(DataPlaneServerCall dataPlaneServerCall) {
       this.dataPlaneServerCall = dataPlaneServerCall;
     }
 

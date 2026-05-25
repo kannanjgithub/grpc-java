@@ -42,6 +42,9 @@ import io.grpc.ServerCall;
 import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
 import io.grpc.Status;
+import io.grpc.ServerServiceDefinition;
+import io.grpc.ServerInterceptors;
+import io.grpc.stub.ServerCalls;
 import io.grpc.inprocess.InProcessChannelBuilder;
 import io.grpc.inprocess.InProcessServerBuilder;
 import io.grpc.internal.FakeClock;
@@ -102,6 +105,101 @@ public class ExternalProcessorServerInterceptorTest {
             @Override public InputStream parse(InputStream stream) { return stream; }
           })
           .build();
+
+  private static final MethodDescriptor<InputStream, InputStream> METHOD_SAY_HELLO_BIDI =
+      MethodDescriptor.<InputStream, InputStream>newBuilder()
+          .setType(MethodDescriptor.MethodType.BIDI_STREAMING)
+          .setFullMethodName("test.TestService/SayHelloBidi")
+          .setRequestMarshaller(new MethodDescriptor.Marshaller<InputStream>() {
+            @Override public InputStream stream(InputStream value) { return value; }
+            @Override public InputStream parse(InputStream stream) { return stream; }
+          })
+          .setResponseMarshaller(new MethodDescriptor.Marshaller<InputStream>() {
+            @Override public InputStream stream(InputStream value) { return value; }
+            @Override public InputStream parse(InputStream stream) { return stream; }
+          })
+          .build();
+
+  private static class ConcurrencyDetectingServerCall extends io.grpc.ForwardingServerCall.SimpleForwardingServerCall<InputStream, InputStream> {
+    private final AtomicInteger activeCalls = new AtomicInteger(0);
+    private final AtomicBoolean concurrentCallDetected = new AtomicBoolean(false);
+
+    ConcurrencyDetectingServerCall(ServerCall<InputStream, InputStream> delegate) {
+      super(delegate);
+    }
+
+    @Override
+    public void sendMessage(InputStream message) {
+      int active = activeCalls.incrementAndGet();
+      if (active > 1) {
+        concurrentCallDetected.set(true);
+      }
+      try {
+        Thread.sleep(50);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+      super.sendMessage(message);
+      activeCalls.decrementAndGet();
+    }
+
+    @Override
+    public void sendHeaders(Metadata headers) {
+      int active = activeCalls.incrementAndGet();
+      if (active > 1) {
+        concurrentCallDetected.set(true);
+      }
+      try {
+        Thread.sleep(50);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+      super.sendHeaders(headers);
+      activeCalls.decrementAndGet();
+    }
+  }
+
+  private String dataPlaneServerName;
+  private io.grpc.Channel dataPlaneChannel;
+
+  private interface DataPlaneServiceHandler {
+    default void sayHello(InputStream request, StreamObserver<InputStream> responseObserver) {
+      responseObserver.onNext(request);
+      responseObserver.onCompleted();
+    }
+
+    default StreamObserver<InputStream> sayHelloBidi(StreamObserver<InputStream> responseObserver) {
+      return new StreamObserver<InputStream>() {
+        @Override public void onNext(InputStream value) { responseObserver.onNext(value); }
+        @Override public void onError(Throwable t) { responseObserver.onError(t); }
+        @Override public void onCompleted() { responseObserver.onCompleted(); }
+      };
+    }
+  }
+
+  private volatile DataPlaneServiceHandler dataPlaneHandler = new DataPlaneServiceHandler() {};
+
+  private void startDataPlane(ServerInterceptor... interceptors) throws Exception {
+    dataPlaneServerName = InProcessServerBuilder.generateName();
+    ServerServiceDefinition dataPlaneService = ServerServiceDefinition.builder("test.TestService")
+        .addMethod(METHOD_SAY_HELLO_RAW, io.grpc.stub.ServerCalls.asyncUnaryCall(
+            (request, responseObserver) -> dataPlaneHandler.sayHello(request, responseObserver)))
+        .addMethod(METHOD_SAY_HELLO_BIDI, io.grpc.stub.ServerCalls.asyncBidiStreamingCall(
+            responseObserver -> dataPlaneHandler.sayHelloBidi(responseObserver)))
+        .build();
+
+    grpcCleanup.register(
+        InProcessServerBuilder.forName(dataPlaneServerName)
+            .addService(ServerInterceptors.intercept(dataPlaneService, java.util.Arrays.asList(interceptors)))
+            .directExecutor()
+            .build()
+            .start());
+
+    dataPlaneChannel = grpcCleanup.register(
+        InProcessChannelBuilder.forName(dataPlaneServerName)
+            .directExecutor()
+            .build());
+  }
 
   private static class InProcessNameResolverProvider extends NameResolverProvider {
     @Override
@@ -229,38 +327,38 @@ public class ExternalProcessorServerInterceptorTest {
     ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
         filterConfig, channelManager, FAKE_CONTEXT);
 
-    ServerCall<InputStream, InputStream> dummyCall = new ServerCall<InputStream, InputStream>() {
+    final AtomicReference<Metadata> receivedHeaders = new AtomicReference<>();
+    ServerInterceptor capturingInterceptor = new ServerInterceptor() {
       @Override
-      public void request(int numMessages) {}
-      @Override
-      public void sendHeaders(Metadata headers) {}
-      @Override
-      public void sendMessage(InputStream message) {}
-      @Override
-      public void close(Status status, Metadata trailers) {}
-      @Override
-      public boolean isCancelled() { return false; }
-      @Override
-      public MethodDescriptor<InputStream, InputStream> getMethodDescriptor() {
-        return METHOD_SAY_HELLO_RAW;
+      public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+          ServerCall<ReqT, RespT> call, Metadata headers, ServerCallHandler<ReqT, RespT> next) {
+        receivedHeaders.set(headers);
+        return next.startCall(call, headers);
       }
     };
 
-    final AtomicReference<Metadata> receivedHeaders = new AtomicReference<>();
-    ServerCallHandler<InputStream, InputStream> dummyNext = new ServerCallHandler<InputStream, InputStream>() {
-      @Override
-      public ServerCall.Listener<InputStream> startCall(ServerCall<InputStream, InputStream> call, Metadata headers) {
-        receivedHeaders.set(headers);
-        return new ServerCall.Listener<InputStream>() {};
-      }
-    };
+    startDataPlane(interceptor, capturingInterceptor);
 
     Metadata initialHeaders = new Metadata();
     initialHeaders.put(Metadata.Key.of("x-initial-header", Metadata.ASCII_STRING_MARSHALLER), "initial-value");
 
-    interceptor.interceptCall(dummyCall, initialHeaders, dummyNext);
+    io.grpc.ClientCall<InputStream, InputStream> clientCall = dataPlaneChannel.newCall(
+        METHOD_SAY_HELLO_RAW, io.grpc.CallOptions.DEFAULT);
+
+    final CountDownLatch callCompletedLatch = new CountDownLatch(1);
+    clientCall.start(new io.grpc.ClientCall.Listener<InputStream>() {
+      @Override
+      public void onClose(Status status, Metadata trailers) {
+        callCompletedLatch.countDown();
+      }
+    }, initialHeaders);
+
+    clientCall.request(1);
+    clientCall.sendMessage(new ByteArrayInputStream("hello".getBytes(StandardCharsets.UTF_8)));
+    clientCall.halfClose();
 
     assertThat(extProcLatch.await(5, TimeUnit.SECONDS)).isTrue();
+    assertThat(callCompletedLatch.await(5, TimeUnit.SECONDS)).isTrue();
     assertThat(receivedHeaders.get()).isNotNull();
     assertThat(receivedHeaders.get().get(Metadata.Key.of("x-mutated-header", Metadata.ASCII_STRING_MARSHALLER)))
         .isEqualTo("mutated-value");
@@ -306,50 +404,129 @@ public class ExternalProcessorServerInterceptorTest {
     ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
         filterConfig, channelManager, FAKE_CONTEXT);
 
-    ServerCall<InputStream, InputStream> dummyCall = new ServerCall<InputStream, InputStream>() {
-      @Override public void request(int numMessages) {}
-      @Override public void sendHeaders(Metadata headers) {}
-      @Override public void sendMessage(InputStream message) {}
-      @Override public void close(Status status, Metadata trailers) {}
-      @Override public boolean isCancelled() { return false; }
-      @Override public MethodDescriptor<InputStream, InputStream> getMethodDescriptor() {
-        return METHOD_SAY_HELLO_RAW;
-      }
-    };
-
     final AtomicBoolean callStarted = new AtomicBoolean(false);
-    ServerCallHandler<InputStream, InputStream> dummyNext = new ServerCallHandler<InputStream, InputStream>() {
+    dataPlaneHandler = new DataPlaneServiceHandler() {
       @Override
-      public ServerCall.Listener<InputStream> startCall(ServerCall<InputStream, InputStream> call, Metadata headers) {
+      public void sayHello(InputStream request, StreamObserver<InputStream> responseObserver) {
         callStarted.set(true);
-        return new ServerCall.Listener<InputStream>() {};
+        responseObserver.onNext(request);
+        responseObserver.onCompleted();
       }
     };
 
-    interceptor.interceptCall(dummyCall, new Metadata(), dummyNext);
+    startDataPlane(interceptor);
 
+    io.grpc.ClientCall<InputStream, InputStream> clientCall = dataPlaneChannel.newCall(
+        METHOD_SAY_HELLO_RAW, io.grpc.CallOptions.DEFAULT);
+
+    final CountDownLatch callCompletedLatch = new CountDownLatch(1);
+    clientCall.start(new io.grpc.ClientCall.Listener<InputStream>() {
+      @Override
+      public void onClose(Status status, Metadata trailers) {
+        callCompletedLatch.countDown();
+      }
+    }, new Metadata());
+
+    clientCall.request(1);
+    clientCall.sendMessage(new ByteArrayInputStream("hello".getBytes(StandardCharsets.UTF_8)));
+    clientCall.halfClose();
+
+    assertThat(callCompletedLatch.await(5, TimeUnit.SECONDS)).isTrue();
     assertThat(callStarted.get()).isTrue();
   }
 
   @Test
   public void serverInterceptor_concurrency_serializesDelegateCallbacks() throws Exception {
-    ExternalProcessor proto = createBaseProto(extProcServerName).build();
+    ExternalProcessor proto = createBaseProto(extProcServerName)
+        .setProcessingMode(ProcessingMode.newBuilder()
+            .setRequestBodyMode(ProcessingMode.BodySendMode.GRPC)
+            .build())
+        .build();
     ConfigOrError<ExternalProcessorFilterConfig> configOrError =
         provider.parseFilterConfig(Any.pack(proto), filterContext);
     assertThat(configOrError.errorDetail).isNull();
     ExternalProcessorFilterConfig filterConfig = configOrError.config;
 
-    final AtomicReference<StreamObserver<ProcessingResponse>> responseObserverRef = new AtomicReference<>();
+    final int ITERATIONS = 500;
+    final CountDownLatch clientDone = new CountDownLatch(1);
+    final AtomicBoolean raceDetected = new AtomicBoolean(false);
+    final AtomicInteger activeServiceCalls = new AtomicInteger(0);
+
     ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
         new ExternalProcessorGrpc.ExternalProcessorImplBase() {
           @Override
           public StreamObserver<ProcessingRequest> process(
               StreamObserver<ProcessingResponse> responseObserver) {
-            responseObserverRef.set(responseObserver);
+            ((ServerCallStreamObserver<ProcessingResponse>) responseObserver).request(100);
             return new StreamObserver<ProcessingRequest>() {
-              @Override public void onNext(ProcessingRequest request) {}
+              @Override
+              public void onNext(ProcessingRequest request) {
+                if (request.hasRequestHeaders()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setRequestHeaders(HeadersResponse.newBuilder()
+                          .setResponse(CommonResponse.newBuilder().build())
+                          .build())
+                      .build());
+                } else if (request.hasRequestBody()) {
+                  boolean eos = request.getRequestBody().getEndOfStream();
+                  BodyResponse.Builder bodyResponseBuilder = BodyResponse.newBuilder();
+                  if (eos) {
+                    bodyResponseBuilder.setResponse(CommonResponse.newBuilder()
+                        .setBodyMutation(BodyMutation.newBuilder()
+                            .setStreamedResponse(StreamedBodyResponse.newBuilder()
+                                .setEndOfStream(true)
+                                .build())
+                            .build())
+                        .build());
+                  } else {
+                    ByteString body = request.getRequestBody().getBody();
+                    bodyResponseBuilder.setResponse(CommonResponse.newBuilder()
+                        .setBodyMutation(BodyMutation.newBuilder()
+                            .setStreamedResponse(StreamedBodyResponse.newBuilder()
+                                .setBody(body)
+                                .build())
+                            .build())
+                        .build());
+                  }
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setRequestBody(bodyResponseBuilder.build())
+                      .build());
+                } else if (request.hasResponseHeaders()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setResponseHeaders(HeadersResponse.newBuilder()
+                          .setResponse(CommonResponse.newBuilder().build())
+                          .build())
+                      .build());
+                } else if (request.hasResponseBody()) {
+                  boolean eos = request.getResponseBody().getEndOfStream();
+                  BodyResponse.Builder bodyResponseBuilder = BodyResponse.newBuilder();
+                  if (eos) {
+                    bodyResponseBuilder.setResponse(CommonResponse.newBuilder()
+                        .setBodyMutation(BodyMutation.newBuilder()
+                            .setStreamedResponse(StreamedBodyResponse.newBuilder()
+                                .setEndOfStream(true)
+                                .build())
+                            .build())
+                        .build());
+                  } else {
+                    ByteString body = request.getResponseBody().getBody();
+                    bodyResponseBuilder.setResponse(CommonResponse.newBuilder()
+                        .setBodyMutation(BodyMutation.newBuilder()
+                            .setStreamedResponse(StreamedBodyResponse.newBuilder()
+                                .setBody(body)
+                                .build())
+                            .build())
+                        .build());
+                  }
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setResponseBody(bodyResponseBuilder.build())
+                      .build());
+                }
+              }
               @Override public void onError(Throwable t) {}
-              @Override public void onCompleted() {}
+              @Override public void onCompleted() {
+                responseObserver.onCompleted();
+              }
             };
           }
         };
@@ -369,74 +546,78 @@ public class ExternalProcessorServerInterceptorTest {
     ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
         filterConfig, channelManager, FAKE_CONTEXT);
 
-    ServerCall<InputStream, InputStream> dummyCall = new ServerCall<InputStream, InputStream>() {
-      @Override public void request(int numMessages) {}
-      @Override public void sendHeaders(Metadata headers) {}
-      @Override public void sendMessage(InputStream message) {}
-      @Override public void close(Status status, Metadata trailers) {}
-      @Override public boolean isCancelled() { return false; }
-      @Override public MethodDescriptor<InputStream, InputStream> getMethodDescriptor() {
-        return METHOD_SAY_HELLO_RAW;
+    dataPlaneHandler = new DataPlaneServiceHandler() {
+      @Override
+      public StreamObserver<InputStream> sayHelloBidi(StreamObserver<InputStream> responseObserver) {
+        return new StreamObserver<InputStream>() {
+          @Override
+          public void onNext(InputStream value) {
+            int active = activeServiceCalls.incrementAndGet();
+            if (active > 1) {
+              raceDetected.set(true);
+            }
+            try {
+              Thread.sleep(1);
+            } catch (InterruptedException e) {
+              Thread.currentThread().interrupt();
+            }
+            activeServiceCalls.decrementAndGet();
+            responseObserver.onNext(value);
+          }
+
+          @Override public void onError(Throwable t) {
+            responseObserver.onError(t);
+          }
+          @Override
+          public void onCompleted() {
+            responseObserver.onCompleted();
+          }
+        };
       }
     };
 
-    final AtomicInteger concurrentCalls = new AtomicInteger(0);
-    final AtomicBoolean raceDetected = new AtomicBoolean(false);
-    final int ITERATIONS = 1000;
+    startDataPlane(interceptor);
 
-    ServerCall.Listener<InputStream> delegateListener = new ServerCall.Listener<InputStream>() {
+    io.grpc.ClientCall<InputStream, InputStream> clientCall = dataPlaneChannel.newCall(
+        METHOD_SAY_HELLO_BIDI, io.grpc.CallOptions.DEFAULT);
+
+    final CountDownLatch clientClosedLatch = new CountDownLatch(1);
+    final AtomicInteger clientReceivedMessages = new AtomicInteger(0);
+
+    clientCall.start(new io.grpc.ClientCall.Listener<InputStream>() {
       @Override
       public void onMessage(InputStream message) {
-        int current = concurrentCalls.incrementAndGet();
-        if (current > 1) {
-          raceDetected.set(true);
-        }
-        try {
-          Thread.sleep(1);
-        } catch (InterruptedException e) {
-          Thread.currentThread().interrupt();
-        }
-        concurrentCalls.decrementAndGet();
+        clientReceivedMessages.incrementAndGet();
+        clientCall.request(1);
       }
-    };
-
-    ServerCallHandler<InputStream, InputStream> dummyNext = new ServerCallHandler<InputStream, InputStream>() {
       @Override
-      public ServerCall.Listener<InputStream> startCall(ServerCall<InputStream, InputStream> call, Metadata headers) {
-        return delegateListener;
+      public void onClose(Status status, Metadata trailers) {
+        clientClosedLatch.countDown();
       }
-    };
+    }, new Metadata());
 
-    @SuppressWarnings("unchecked")
-    ExternalProcessorServerInterceptor.DataPlaneServerListener serverListener =
-        (ExternalProcessorServerInterceptor.DataPlaneServerListener)
-            interceptor.interceptCall(dummyCall, new Metadata(), dummyNext);
+    clientCall.request(1);
 
-    // Simulate that the call is active and pass-through mode is enabled for quick delegate execution
-    serverListener.setDelegate(delegateListener);
-
-    Thread threadA = new Thread(() -> {
-      for (int i = 0; i < ITERATIONS; i++) {
-        serverListener.onMessage(new ByteArrayInputStream(new byte[0]));
-      }
-    });
-
-    Thread threadB = new Thread(() -> {
-      for (int i = 0; i < ITERATIONS; i++) {
-        serverListener.onExternalBody(ByteString.EMPTY);
+    Thread clientThread = new Thread(() -> {
+      try {
+        for (int i = 0; i < ITERATIONS; i++) {
+          clientCall.sendMessage(new ByteArrayInputStream(new byte[10]));
+          Thread.sleep(0, 10000);
+        }
+        clientCall.halfClose();
+        clientDone.countDown();
+      } catch (Exception e) {
+        e.printStackTrace();
+        raceDetected.set(true);
       }
     });
 
-    threadA.start();
-    threadB.start();
-    threadA.join();
-    threadB.join();
+    clientThread.start();
+    clientThread.join();
 
-    StreamObserver<ProcessingResponse> responseObserver = responseObserverRef.get();
-    if (responseObserver != null) {
-      responseObserver.onCompleted();
-    }
-
+    assertThat(clientDone.await(5, TimeUnit.SECONDS)).isTrue();
+    assertThat(clientClosedLatch.await(5, TimeUnit.SECONDS)).isTrue();
+    assertThat(clientReceivedMessages.get()).isEqualTo(ITERATIONS);
     assertThat(raceDetected.get()).isFalse();
   }
 
@@ -462,6 +643,7 @@ public class ExternalProcessorServerInterceptorTest {
           @Override
           public StreamObserver<ProcessingRequest> process(
               StreamObserver<ProcessingResponse> responseObserver) {
+            ((ServerCallStreamObserver<ProcessingResponse>) responseObserver).request(100);
             responseObserverRef.set(responseObserver);
             return new StreamObserver<ProcessingRequest>() {
               @Override
@@ -513,8 +695,8 @@ public class ExternalProcessorServerInterceptorTest {
     };
 
     @SuppressWarnings("unchecked")
-    ExternalProcessorServerInterceptor.DataPlaneServerListener serverListener =
-        (ExternalProcessorServerInterceptor.DataPlaneServerListener)
+    ServerCall.Listener<InputStream> serverListener =
+        (ServerCall.Listener<InputStream>) (ServerCall.Listener<?>)
             interceptor.interceptCall(dummyCall, new Metadata(), dummyNext);
 
     // Invocate onMessage() while the call is IDLE (headers response has not been sent)
@@ -539,7 +721,8 @@ public class ExternalProcessorServerInterceptorTest {
       responseObserver.onCompleted();
     }
 
-    // After control stream completes, it should trigger fail-open/fallback activation of the data plane call
+    // After control stream completes, it should trigger fallback activation of the data plane call
+    // Wait for the fallback processing task on directExecutor to complete
     assertThat(startCallCalled.get()).isTrue();
   }
 
@@ -590,46 +773,48 @@ public class ExternalProcessorServerInterceptorTest {
     ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
         filterConfig, channelManager, FAKE_CONTEXT);
 
-    final AtomicInteger activeSendMessageCalls = new AtomicInteger(0);
-    final AtomicBoolean concurrentCallDetected = new AtomicBoolean(false);
-    final CountDownLatch messageSentLatch = new CountDownLatch(2);
-
-    ServerCall<InputStream, InputStream> mockCall = new ServerCall<InputStream, InputStream>() {
-      @Override public void request(int numMessages) {}
-      @Override public void sendHeaders(Metadata headers) {}
-      @Override public void sendMessage(InputStream message) {
-        int active = activeSendMessageCalls.incrementAndGet();
-        if (active > 1) {
-          concurrentCallDetected.set(true);
-        }
-        try {
-          // Small sleep to encourage overlap if not serialized
-          Thread.sleep(50);
-        } catch (InterruptedException e) {
-          Thread.currentThread().interrupt();
-        }
-        activeSendMessageCalls.decrementAndGet();
-        messageSentLatch.countDown();
-      }
-      @Override public void close(Status status, Metadata trailers) {}
-      @Override public boolean isCancelled() { return false; }
-      @Override public MethodDescriptor<InputStream, InputStream> getMethodDescriptor() {
-        return METHOD_SAY_HELLO_RAW;
-      }
-    };
-
     final AtomicReference<ServerCall<InputStream, InputStream>> wrappedCallRef = new AtomicReference<>();
-    ServerCallHandler<InputStream, InputStream> dummyNext = new ServerCallHandler<InputStream, InputStream>() {
+    ServerInterceptor capturingInterceptor = new ServerInterceptor() {
+      @SuppressWarnings("unchecked")
       @Override
-      public ServerCall.Listener<InputStream> startCall(ServerCall<InputStream, InputStream> call, Metadata headers) {
-        wrappedCallRef.set(call);
-        return new ServerCall.Listener<InputStream>() {};
+      public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+          ServerCall<ReqT, RespT> call, Metadata headers, ServerCallHandler<ReqT, RespT> next) {
+        wrappedCallRef.set((ServerCall<InputStream, InputStream>) call);
+        return next.startCall(call, headers);
       }
     };
 
-    interceptor.interceptCall(mockCall, new Metadata(), dummyNext);
+    final AtomicReference<ConcurrencyDetectingServerCall> rawCallRef = new AtomicReference<>();
+    ServerInterceptor capturingRawCallInterceptor = new ServerInterceptor() {
+      @SuppressWarnings("unchecked")
+      @Override
+      public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+          ServerCall<ReqT, RespT> call, Metadata headers, ServerCallHandler<ReqT, RespT> next) {
+        ConcurrencyDetectingServerCall wrapped = new ConcurrencyDetectingServerCall(
+            (ServerCall<InputStream, InputStream>) call);
+        rawCallRef.set(wrapped);
+        return next.startCall((ServerCall<ReqT, RespT>) (ServerCall<?, ?>) wrapped, headers);
+      }
+    };
 
-    // Complete headers processing to activate the call
+    startDataPlane(capturingRawCallInterceptor, interceptor, capturingInterceptor);
+
+    Metadata initialHeaders = new Metadata();
+    io.grpc.ClientCall<InputStream, InputStream> clientCall = dataPlaneChannel.newCall(
+        METHOD_SAY_HELLO_RAW, io.grpc.CallOptions.DEFAULT);
+
+    final CountDownLatch callCompletedLatch = new CountDownLatch(1);
+    clientCall.start(new io.grpc.ClientCall.Listener<InputStream>() {
+      @Override
+      public void onClose(Status status, Metadata trailers) {
+        callCompletedLatch.countDown();
+      }
+    }, initialHeaders);
+
+    clientCall.request(1);
+    clientCall.sendMessage(new ByteArrayInputStream("hello".getBytes(StandardCharsets.UTF_8)));
+    clientCall.halfClose();
+
     boolean active = streamActiveLatch.await(5, TimeUnit.SECONDS);
     assertThat(active).isTrue();
 
@@ -640,32 +825,40 @@ public class ExternalProcessorServerInterceptorTest {
             .build())
         .build());
 
-    // Wait for startCall to be invoked and capture the wrapped call
     ServerCall<InputStream, InputStream> wrappedCall = wrappedCallRef.get();
     assertThat(wrappedCall).isNotNull();
+    wrappedCall.sendHeaders(new Metadata());
 
-    // Trigger stream failure on the control plane to initiate fail-open / draining
+    ConcurrencyDetectingServerCall rawCall = rawCallRef.get();
+    assertThat(rawCall).isNotNull();
+
     responseObserver.onError(new RuntimeException("Stream dropped"));
 
-    // Launch thread to concurrently send outbound messages via the application thread and the control plane draining thread
+    final CountDownLatch messageSentLatch = new CountDownLatch(2);
     Thread appThread = new Thread(() -> {
-      wrappedCall.sendMessage(new ByteArrayInputStream("app-msg".getBytes(StandardCharsets.UTF_8)));
+      try {
+        wrappedCall.sendMessage(new ByteArrayInputStream("app-msg".getBytes(StandardCharsets.UTF_8)));
+        messageSentLatch.countDown();
+      } catch (Exception e) {
+      }
     });
 
-    // Wait for the control stream to fail and queue the pending messages, then execute both concurrently
     wrappedCall.sendMessage(new ByteArrayInputStream("buffered-msg".getBytes(StandardCharsets.UTF_8)));
+    messageSentLatch.countDown();
 
     appThread.start();
     appThread.join();
 
     boolean sent = messageSentLatch.await(5, TimeUnit.SECONDS);
     assertThat(sent).isTrue();
-    assertThat(concurrentCallDetected.get()).isFalse();
+    assertThat(rawCall.concurrentCallDetected.get()).isFalse();
   }
 
   @Test
   public void serverInterceptor_concurrentSendHeadersAndFailOpen_flushesHeadersCorrectly() throws Exception {
-    ExternalProcessor proto = createBaseProto(extProcServerName).build();
+    ExternalProcessor proto = createBaseProto(extProcServerName)
+        .setFailureModeAllow(true)
+        .build();
     ConfigOrError<ExternalProcessorFilterConfig> configOrError =
         provider.parseFilterConfig(Any.pack(proto), filterContext);
     assertThat(configOrError.errorDetail).isNull();
@@ -704,33 +897,49 @@ public class ExternalProcessorServerInterceptorTest {
     ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
         filterConfig, channelManager, FAKE_CONTEXT);
 
-    final CountDownLatch headersSentLatch = new CountDownLatch(1);
-    final AtomicReference<Metadata> receivedHeadersRef = new AtomicReference<>();
-
-    ServerCall<InputStream, InputStream> mockCall = new ServerCall<InputStream, InputStream>() {
-      @Override public void request(int numMessages) {}
-      @Override public void sendHeaders(Metadata headers) {
-        receivedHeadersRef.set(headers);
-        headersSentLatch.countDown();
-      }
-      @Override public void sendMessage(InputStream message) {}
-      @Override public void close(Status status, Metadata trailers) {}
-      @Override public boolean isCancelled() { return false; }
-      @Override public MethodDescriptor<InputStream, InputStream> getMethodDescriptor() {
-        return METHOD_SAY_HELLO_RAW;
-      }
-    };
-
     final AtomicReference<ServerCall<InputStream, InputStream>> wrappedCallRef = new AtomicReference<>();
-    ServerCallHandler<InputStream, InputStream> dummyNext = new ServerCallHandler<InputStream, InputStream>() {
+    ServerInterceptor capturingInterceptor = new ServerInterceptor() {
+      @SuppressWarnings("unchecked")
       @Override
-      public ServerCall.Listener<InputStream> startCall(ServerCall<InputStream, InputStream> call, Metadata headers) {
-        wrappedCallRef.set(call);
-        return new ServerCall.Listener<InputStream>() {};
+      public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+          ServerCall<ReqT, RespT> call, Metadata headers, ServerCallHandler<ReqT, RespT> next) {
+        wrappedCallRef.set((ServerCall<InputStream, InputStream>) call);
+        return next.startCall(call, headers);
       }
     };
 
-    interceptor.interceptCall(mockCall, new Metadata(), dummyNext);
+    final AtomicReference<ConcurrencyDetectingServerCall> rawCallRef = new AtomicReference<>();
+    ServerInterceptor capturingRawCallInterceptor = new ServerInterceptor() {
+      @SuppressWarnings("unchecked")
+      @Override
+      public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+          ServerCall<ReqT, RespT> call, Metadata headers, ServerCallHandler<ReqT, RespT> next) {
+        ConcurrencyDetectingServerCall wrapped = new ConcurrencyDetectingServerCall(
+            (ServerCall<InputStream, InputStream>) call);
+        rawCallRef.set(wrapped);
+        return next.startCall((ServerCall<ReqT, RespT>) (ServerCall<?, ?>) wrapped, headers);
+      }
+    };
+
+    startDataPlane(capturingRawCallInterceptor, interceptor, capturingInterceptor);
+
+    Metadata initialHeaders = new Metadata();
+    io.grpc.ClientCall<InputStream, InputStream> clientCall = dataPlaneChannel.newCall(
+        METHOD_SAY_HELLO_RAW, io.grpc.CallOptions.DEFAULT);
+
+    final CountDownLatch headersReceivedLatch = new CountDownLatch(1);
+    final AtomicReference<Metadata> receivedResponseHeadersRef = new AtomicReference<>();
+    clientCall.start(new io.grpc.ClientCall.Listener<InputStream>() {
+      @Override
+      public void onHeaders(Metadata headers) {
+        receivedResponseHeadersRef.set(headers);
+        headersReceivedLatch.countDown();
+      }
+    }, initialHeaders);
+
+    clientCall.request(1);
+    clientCall.sendMessage(new ByteArrayInputStream("hello".getBytes(StandardCharsets.UTF_8)));
+    clientCall.halfClose();
 
     boolean active = streamActiveLatch.await(5, TimeUnit.SECONDS);
     assertThat(active).isTrue();
@@ -745,21 +954,25 @@ public class ExternalProcessorServerInterceptorTest {
     ServerCall<InputStream, InputStream> wrappedCall = wrappedCallRef.get();
     assertThat(wrappedCall).isNotNull();
 
+    ConcurrencyDetectingServerCall rawCall = rawCallRef.get();
+    assertThat(rawCall).isNotNull();
+
     Thread appThread = new Thread(() -> {
       Metadata headers = new Metadata();
       headers.put(Metadata.Key.of("x-resp-header", Metadata.ASCII_STRING_MARSHALLER), "val");
       wrappedCall.sendHeaders(headers);
+      wrappedCall.close(Status.OK, new Metadata());
     });
 
     appThread.start();
-    // Concurrently fail the control plane stream to trigger fail-open / proceedWithSendHeaders()
     responseObserver.onError(new RuntimeException("Stream failure"));
 
     appThread.join();
 
-    boolean headersSent = headersSentLatch.await(5, TimeUnit.SECONDS);
+    boolean headersSent = headersReceivedLatch.await(5, TimeUnit.SECONDS);
     assertThat(headersSent).isTrue();
-    assertThat(receivedHeadersRef.get().get(
+    assertThat(receivedResponseHeadersRef.get().get(
         Metadata.Key.of("x-resp-header", Metadata.ASCII_STRING_MARSHALLER))).isEqualTo("val");
+    assertThat(rawCall.concurrentCallDetected.get()).isFalse();
   }
 }
