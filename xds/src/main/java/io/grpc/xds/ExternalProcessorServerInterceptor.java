@@ -47,6 +47,7 @@ import io.envoyproxy.envoy.service.ext_proc.v3.ProcessingResponse;
 import io.envoyproxy.envoy.service.ext_proc.v3.ProtocolConfiguration;
 import io.envoyproxy.envoy.service.ext_proc.v3.StreamedBodyResponse;
 import io.grpc.DoubleHistogramMetricInstrument;
+import io.grpc.Context;
 import io.grpc.ForwardingServerCall.SimpleForwardingServerCall;
 import io.grpc.ForwardingServerCallListener.SimpleForwardingServerCallListener;
 import io.grpc.Metadata;
@@ -136,9 +137,12 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     }
 
 
+    Context callContext = Context.current();
+
     DataPlaneServerCall dataPlaneServerCall = new DataPlaneServerCall(
         rawCall, extProcStub, filterConfig, filterConfig.getMutationRulesConfig(),
-        scheduler, call.getMethodDescriptor(), metricsRecorder, call.getAuthority(), rawNext, headers);
+        scheduler, call.getMethodDescriptor(), metricsRecorder, call.getAuthority(), rawNext, headers,
+        callContext);
 
     dataPlaneServerCall.start();
 
@@ -302,6 +306,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     private final MetricRecorder metricsRecorder;
     private final String authority;
     private final ServerCallHandler<InputStream, InputStream> rawNext;
+    private final Context callContext;
     private volatile Metadata requestHeaders;
 
     private volatile Metadata savedResponseHeaders;
@@ -334,7 +339,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
         MetricRecorder metricsRecorder,
         String authority,
         ServerCallHandler<InputStream, InputStream> rawNext,
-        Metadata requestHeaders) {
+        Metadata requestHeaders,
+        Context callContext) {
       super(rawCall);
       this.rawCall = rawCall;
       this.delegateExecutor = new SerializingExecutor(com.google.common.util.concurrent.MoreExecutors.directExecutor());
@@ -348,6 +354,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       this.authority = authority;
       this.rawNext = rawNext;
       this.requestHeaders = requestHeaders;
+      this.callContext = callContext;
       this.wrappedListener = new DataPlaneServerListener(this);
     }
 
@@ -415,7 +422,13 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
         recordDuration(clientHeadersDuration, durationNanos);
         clientHeadersStartNanos = 0;
       }
-      ServerCall.Listener<InputStream> appListener = rawNext.startCall(this, requestHeaders);
+      Context previous = callContext.attach();
+      ServerCall.Listener<InputStream> appListener;
+      try {
+        appListener = rawNext.startCall(this, requestHeaders);
+      } finally {
+        callContext.detach(previous);
+      }
       wrappedListener.setDelegate(appListener);
       drainPendingRequests();
       wrappedListener.onReadyNotify();
@@ -1095,15 +1108,6 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       drainPendingDrainingMessages();
       proceedWithClose();
     }
-
-    void proceedWithHalfClose() {
-      if (clientHalfCloseStartNanos > 0) {
-        long durationNanos = System.nanoTime() - clientHalfCloseStartNanos;
-        recordDuration(clientHalfCloseDuration, durationNanos);
-        clientHalfCloseStartNanos = 0;
-      }
-      wrappedListener.proceedWithHalfClose();
-    }
   }
 
   private static final class DataPlaneServerListener extends ServerCall.Listener<InputStream> {
@@ -1119,13 +1123,15 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     void setDelegate(ServerCall.Listener<InputStream> delegate) {
       dataPlaneServerCall.delegateExecutor.execute(() -> {
         this.delegate = delegate;
-        InputStream msg;
-        while ((msg = savedMessages.poll()) != null) {
-          delegate.onMessage(msg);
-        }
-        if (halfCloseReceived) {
-          delegate.onHalfClose();
-        }
+        dataPlaneServerCall.callContext.run(() -> {
+          InputStream msg;
+          while ((msg = savedMessages.poll()) != null) {
+            delegate.onMessage(msg);
+          }
+          if (halfCloseReceived) {
+            delegate.onHalfClose();
+          }
+        });
       });
     }
 
@@ -1140,7 +1146,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     void onReadyNotify() {
       ServerCall.Listener<InputStream> del = delegate;
       if (del != null) {
-        del.onReady();
+        dataPlaneServerCall.callContext.run(del::onReady);
       }
     }
 
@@ -1149,7 +1155,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       dataPlaneServerCall.delegateExecutor.execute(() -> {
         ServerCall.Listener<InputStream> del = delegate;
         if (dataPlaneServerCall.passThroughMode.get() && del != null) {
-          del.onMessage(message);
+          dataPlaneServerCall.callContext.run(() -> del.onMessage(message));
           return;
         }
 
@@ -1164,7 +1170,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
             // We must buffer because the application call hasn't started yet
             savedMessages.add(message);
           } else if (del != null) {
-            del.onMessage(message);
+            dataPlaneServerCall.callContext.run(() -> del.onMessage(message));
           }
           return;
         }
@@ -1214,14 +1220,14 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       }
       ServerCall.Listener<InputStream> del = delegate;
       if (del != null) {
-        del.onHalfClose();
+        dataPlaneServerCall.callContext.run(del::onHalfClose);
       }
     }
 
     void onExternalBody(ByteString body) {
       ServerCall.Listener<InputStream> del = delegate;
       if (del != null) {
-        del.onMessage(body.newInput());
+        dataPlaneServerCall.callContext.run(() -> del.onMessage(body.newInput()));
       }
     }
 
@@ -1250,7 +1256,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
             Status.CANCELLED.withDescription("Client cancelled RPC").asRuntimeException());
         ServerCall.Listener<InputStream> del = delegate;
         if (del != null) {
-          del.onCancel();
+          dataPlaneServerCall.callContext.run(del::onCancel);
         }
       });
     }
@@ -1260,7 +1266,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       dataPlaneServerCall.delegateExecutor.execute(() -> {
         ServerCall.Listener<InputStream> del = delegate;
         if (del != null) {
-          del.onComplete();
+          dataPlaneServerCall.callContext.run(del::onComplete);
         }
       });
     }
