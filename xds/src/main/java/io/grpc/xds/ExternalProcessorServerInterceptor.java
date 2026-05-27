@@ -28,6 +28,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.io.BaseEncoding;
 import com.google.common.io.ByteStreams;
+import com.google.common.util.concurrent.MoreExecutors;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.UnsafeByteOperations;
 import com.google.protobuf.Struct;
@@ -134,7 +135,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     ScheduledExecutorService scheduler = SharedResourceHolder.get(GrpcUtil.TIMER_SERVICE);
     ExternalProcessorGrpc.ExternalProcessorStub extProcStub = ExternalProcessorGrpc.newStub(
         cachedChannelManager.getChannel(filterConfig.getGrpcServiceConfig()))
-        .withExecutor(com.google.common.util.concurrent.MoreExecutors.directExecutor());
+        .withExecutor(MoreExecutors.directExecutor());
 
     if (filterConfig.getGrpcServiceConfig().timeout().isPresent()) {
       long timeoutNanos = filterConfig.getGrpcServiceConfig().timeout().get().toNanos();
@@ -350,7 +351,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
         Context callContext) {
       super(rawCall);
       this.rawCall = rawCall;
-      this.delegateExecutor = new SerializingExecutor(com.google.common.util.concurrent.MoreExecutors.directExecutor());
+      this.delegateExecutor = new SerializingExecutor(MoreExecutors.directExecutor());
       this.extProcStub = extProcStub.withExecutor(this.delegateExecutor);
       this.config = config;
       this.currentProcessingMode = config.getExternalProcessor().getProcessingMode();
@@ -1100,7 +1101,10 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       boolean terminal = false;
       if (response.hasResponseTrailers()) {
         terminal = true;
-      } else if (response.hasResponseHeaders() && savedStatus != null) {
+      } else if (response.hasResponseHeaders() && savedStatus != null
+          && currentProcessingMode.getResponseBodyMode() == ProcessingMode.BodySendMode.NONE) {
+        terminal = true;
+      } else if (response.hasResponseBody() && responseSideClosed.get()) {
         terminal = true;
       }
 
