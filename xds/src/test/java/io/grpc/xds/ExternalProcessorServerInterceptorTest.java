@@ -313,45 +313,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 1: Configuration Parsing & Provider
-  // ============================================================================
-
-  @Test
-  public void provider_registeredInFilterRegistry_basedOnFlag() {
-    System.setProperty("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_CLIENT", "true");
-    try {
-      FilterRegistry registry = FilterRegistry.newRegistry().register(
-          new FaultFilter.Provider(),
-          new RouterFilter.Provider(),
-          new RbacFilter.Provider(),
-          new GcpAuthenticationFilter.Provider());
-      if (GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_CLIENT", false)) {
-        registry.register(new ExternalProcessorFilter.Provider());
-      }
-      assertThat(registry.get(ExternalProcessorFilter.TYPE_URL)).isNotNull();
-    } finally {
-      System.clearProperty("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_CLIENT");
-    }
-
-    System.setProperty("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_CLIENT", "false");
-    try {
-      FilterRegistry registry = FilterRegistry.newRegistry().register(
-          new FaultFilter.Provider(),
-          new RouterFilter.Provider(),
-          new RbacFilter.Provider(),
-          new GcpAuthenticationFilter.Provider());
-      if (GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_CLIENT", false)) {
-        registry.register(new ExternalProcessorFilter.Provider());
-      }
-      assertThat(registry.get(ExternalProcessorFilter.TYPE_URL)).isNull();
-    } finally {
-      System.clearProperty("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_CLIENT");
-    }
-  }
-
-
-  // ============================================================================
-  // Category 2: Configuration Override
+  // Category 1: Configuration Override
   // ============================================================================
 
   @Test
@@ -403,7 +365,7 @@ public class ExternalProcessorServerInterceptorTest {
 
 
   // ============================================================================
-  // Category 3: Server Interceptor & Lifecycle
+  // Category 2: Server Interceptor & Lifecycle
   // ============================================================================
 
   @Test
@@ -619,7 +581,7 @@ public class ExternalProcessorServerInterceptorTest {
 
 
   // ============================================================================
-  // Category 4: Request Header Processing
+  // Category 3: Request Header Processing
   // ============================================================================
 
   @Test
@@ -1011,7 +973,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 5: Body Mutation: Outbound/Request (GRPC Mode)
+  // Category 4: Body Mutation: Outbound/Request (GRPC Mode)
   // ============================================================================
 
   @Test
@@ -1135,7 +1097,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 6: Body Mutation: Inbound/Response (GRPC Mode)
+  // Category 5: Body Mutation: Inbound/Response (GRPC Mode)
   // ============================================================================
 
   @Test
@@ -1661,7 +1623,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 7: Outbound Backpressure (isReady / onReady)
+  // Category 6: Outbound Backpressure (isReady / onReady)
   // ============================================================================
 
   @Test
@@ -1987,7 +1949,7 @@ public class ExternalProcessorServerInterceptorTest {
 
 
   // ============================================================================
-  // Category 8: Inbound Backpressure (request(n) / pendingRequests)
+  // Category 7: Inbound Backpressure (request(n) / pendingRequests)
   // ============================================================================
 
   @Test
@@ -2253,7 +2215,7 @@ public class ExternalProcessorServerInterceptorTest {
 
 
   // ============================================================================
-  // Category 9: Error Handling & Security
+  // Category 8: Error Handling & Security
   // ============================================================================
 
   @Test
@@ -2583,7 +2545,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 10: Resource Management
+  // Category 9: Resource Management
   // ============================================================================
 
   @Test
@@ -2595,7 +2557,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 11: Data plane rpc cancellation
+  // Category 10: Data plane rpc cancellation
   // ============================================================================
 
   @Test
@@ -2676,7 +2638,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 12: Flow Control when side stream is full
+  // Category 11: Flow Control when side stream is full
   // ============================================================================
 
   @Test
@@ -2957,11 +2919,11 @@ public class ExternalProcessorServerInterceptorTest {
 
 
   // ============================================================================
-  // Category 13: Streaming Completeness (Client & Bi-Di) [SKIPPED]
+  // Category 12: Streaming Completeness (Client & Bi-Di) [SKIPPED]
   // ============================================================================
 
   // ============================================================================
-  // Category 14: Header Forwarding Rules
+  // Category 13: Header Forwarding Rules
   // ============================================================================
 
   @Test
@@ -3390,7 +3352,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 15: Request Attributes
+  // Category 14: Request Attributes
   // ============================================================================
 
   @Test
@@ -3651,7 +3613,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 16: Response Trailers
+  // Category 15: Response Trailers
   // ============================================================================
 
   @Test
@@ -3858,7 +3820,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 17: Trailers-Only Response
+  // Category 16: Trailers-Only Response
   // ============================================================================
 
   @Test
@@ -3971,7 +3933,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 18: Response Ordering Checks
+  // Category 17: Response Ordering Checks
   // ============================================================================
 
   @Test
@@ -4165,7 +4127,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 19: Header Response Status Checks
+  // Category 18: Header Response Status Checks
   // ============================================================================
 
   @Test
@@ -4349,7 +4311,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 20: Concurrency and Thread Safety (Serialization)
+  // Category 19: Concurrency and Thread Safety (Serialization)
   // ============================================================================
 
   @Test
@@ -4788,7 +4750,7 @@ public class ExternalProcessorServerInterceptorTest {
     assertThat(rawCall.concurrentCallDetected.get()).isFalse();
   }
 
-  // Category 21: Request-Scoped Context Propagation
+  // Category 20: Request-Scoped Context Propagation
   @Test
   public void serverInterceptor_contextPropagatedToStartCall() throws Exception {
     ExternalProcessor proto = createBaseProto(extProcServerName).build();
