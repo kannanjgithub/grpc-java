@@ -1080,11 +1080,11 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     private void drainPendingDrainingMessages() {
       synchronized (rawCallLock) {
-        passThroughMode.set(true);
         InputStream msg;
         while ((msg = pendingDrainingMessages.poll()) != null) {
           super.sendMessage(msg);
         }
+        passThroughMode.set(true);
       }
     }
 
