@@ -105,7 +105,6 @@ import javax.annotation.Nullable;
 final class ExternalProcessorServerInterceptor implements ServerInterceptor {
   private final CachedChannelManager cachedChannelManager;
   private final ExternalProcessorFilterConfig filterConfig;
-  private final FilterContext context;
   private final MetricRecorder metricsRecorder;
 
   ExternalProcessorServerInterceptor(
@@ -114,7 +113,6 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       FilterContext context) {
     this.filterConfig = checkNotNull(filterConfig, "filterConfig");
     this.cachedChannelManager = checkNotNull(cachedChannelManager, "cachedChannelManager");
-    this.context = checkNotNull(context, "context");
     this.metricsRecorder = checkNotNull(context.metricsRecorder(), "metricsRecorder");
   }
 
@@ -332,7 +330,9 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
         new AtomicReference<>(ExtProcStreamState.ACTIVE);
     final AtomicBoolean passThroughMode = new AtomicBoolean(false);
     final AtomicBoolean halfClosed = new AtomicBoolean(false);
-    final AtomicBoolean responseSideClosed = new AtomicBoolean(false);
+    final AtomicBoolean requestSideClosed = new AtomicBoolean(false);
+    final AtomicBoolean dataPlaneCallClosed = new AtomicBoolean(false);
+
     final AtomicBoolean isProcessingTrailers = new AtomicBoolean(false);
     final AtomicBoolean responseHeadersSent = new AtomicBoolean(false);
     final AtomicBoolean terminationTriggered = new AtomicBoolean(false);
@@ -440,6 +440,9 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       wrappedListener.setDelegate(appListener);
       drainPendingRequests();
       wrappedListener.onReadyNotify();
+      if (wrappedListener.halfCloseDeferred) {
+        wrappedListener.handleDeferredHalfClose();
+      }
     }
 
     private void recordDuration(DoubleHistogramMetricInstrument instrument, long durationNanos) {
@@ -618,7 +621,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
               proceedWithClose();
             }
 
-            checkEndOfStream(response);
+            checkEndOfStream();
           } catch (Throwable t) {
             internalOnError(t);
           }
@@ -712,7 +715,9 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
             extProcClientCallRequestObserver.onCompleted();
           }
         }
+        expectedResponses.clear();
       }
+      proceedWithClose();
     }
 
     private void cancelExtProcStream(Throwable t) {
@@ -726,6 +731,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
             extProcClientCallRequestObserver = null;
           }
         }
+        expectedResponses.clear();
+        proceedWithClose();
       }
     }
 
@@ -740,6 +747,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
             extProcClientCallRequestObserver = null;
           }
         }
+        expectedResponses.clear();
         if (config.getFailureModeAllow()) {
           handleFailOpen();
         } else {
@@ -860,7 +868,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     @Override
     public void sendMessage(InputStream message) {
-      if (responseSideClosed.get()) {
+      if (dataPlaneCallClosed.get()) {
         return;
       }
 
@@ -959,7 +967,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     void proceedWithClose() {
       synchronized (rawCallLock) {
-        if (savedStatus != null) {
+        if (savedStatus != null 
+            && (isExtProcStreamCompleted() || config.getObservabilityMode())) {
           if (markDataPlaneCallClosed()) {
             proceedWithClose(savedStatus, savedTrailers);
           }
@@ -970,12 +979,14 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     }
 
     private void proceedWithClose(Status status, Metadata trailers) {
-      if (serverTrailersStartNanos > 0) {
-        long durationNanos = System.nanoTime() - serverTrailersStartNanos;
-        recordDuration(serverTrailersDuration, durationNanos);
-        serverTrailersStartNanos = 0;
+      if (dataPlaneCallClosed.compareAndSet(false, true)) {
+        if (serverTrailersStartNanos > 0) {
+          long durationNanos = System.nanoTime() - serverTrailersStartNanos;
+          recordDuration(serverTrailersDuration, durationNanos);
+          serverTrailersStartNanos = 0;
+        }
+        super.close(status, trailers);
       }
-      super.close(status, trailers);
     }
 
     private void triggerCloseHandshake() {
@@ -994,14 +1005,9 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
                 .build())
             .build());
       } else {
-        sendToExtProc(ProcessingRequest.newBuilder()
-            .setResponseBody(HttpBody.newBuilder()
-                .setEndOfStreamWithoutMessage(true)
-                .build())
-            .build());
-
-        if (config.getObservabilityMode()) {
-          proceedWithClose();
+        if (isRequestSideCompleted()) {
+          unblockAfterStreamComplete();
+          closeExtProcStream();
         }
       }
     }
@@ -1024,11 +1030,12 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     }
 
     private void handleRequestBodyResponse(BodyResponse bodyResponse) {
-      if (bodyResponse.hasResponse() && bodyResponse.getResponse().hasBodyMutation()) {
+      if (bodyResponse.hasResponse()
+      && bodyResponse.getResponse().hasBodyMutation()) {
         BodyMutation mutation = bodyResponse.getResponse().getBodyMutation();
         if (mutation.hasStreamedResponse()) {
           StreamedBodyResponse streamed = mutation.getStreamedResponse();
-          if (!streamed.getBody().isEmpty()) {
+          if (!streamed.getEndOfStreamWithoutMessage()) {
             wrappedListener.onExternalBody(streamed.getBody());
           }
           if (streamed.getEndOfStream() || streamed.getEndOfStreamWithoutMessage()) {
@@ -1039,18 +1046,14 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     }
 
     private void handleResponseBodyResponse(BodyResponse bodyResponse) {
+      if (dataPlaneCallClosed.get()) {
+        return;
+      }
       if (bodyResponse.hasResponse() && bodyResponse.getResponse().hasBodyMutation()) {
         BodyMutation mutation = bodyResponse.getResponse().getBodyMutation();
         if (mutation.hasStreamedResponse()) {
           StreamedBodyResponse streamed = mutation.getStreamedResponse();
-          if (!streamed.getBody().isEmpty()) {
-            super.sendMessage(new OutboundZeroCopyInputStream(streamed.getBody()));
-          }
-        }
-      }
-      if (responseSideClosed.compareAndSet(false, true)) {
-        if (terminationTriggered.get()) {
-          proceedWithClose();
+          super.sendMessage(new OutboundZeroCopyInputStream(streamed.getBody()));
         }
       }
     }
@@ -1097,21 +1100,18 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       closeExtProcStream();
     }
 
-    private void checkEndOfStream(ProcessingResponse response) {
-      boolean terminal = false;
-      if (response.hasResponseTrailers()) {
-        terminal = true;
-      } else if (response.hasResponseHeaders() && savedStatus != null
-          && currentProcessingMode.getResponseBodyMode() == ProcessingMode.BodySendMode.NONE) {
-        terminal = true;
-      } else if (response.hasResponseBody() && responseSideClosed.get()) {
-        terminal = true;
-      }
-
-      if (terminal) {
+    private void checkEndOfStream() {
+      if (terminationTriggered.get() && isRequestSideCompleted()
+          && !expectedResponses.contains(EventType.RESPONSE_TRAILERS)) {
         unblockAfterStreamComplete();
         closeExtProcStream();
       }
+    }
+
+    private boolean isRequestSideCompleted() {
+      return (currentProcessingMode.getRequestHeaderMode() != ProcessingMode.HeaderSendMode.SEND
+          && currentProcessingMode.getRequestBodyMode() != ProcessingMode.BodySendMode.GRPC)
+          || requestSideClosed.get();
     }
 
     void unblockAfterStreamComplete() {
@@ -1125,6 +1125,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     private final DataPlaneServerCall dataPlaneServerCall;
     private final Queue<InputStream> savedMessages = new ConcurrentLinkedQueue<>();
     private volatile boolean halfCloseReceived;
+    private volatile boolean halfCloseDeferred;
     private volatile ServerCall.Listener<InputStream> delegate;
 
     private DataPlaneServerListener(DataPlaneServerCall dataPlaneServerCall) {
@@ -1164,6 +1165,9 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     @Override
     public void onMessage(InputStream message) {
       dataPlaneServerCall.delegateExecutor.execute(() -> {
+        if (dataPlaneServerCall.requestSideClosed.get()) {
+          return;
+        }
         ServerCall.Listener<InputStream> del = delegate;
         if (dataPlaneServerCall.passThroughMode.get() && del != null) {
           dataPlaneServerCall.callContext.run(() -> del.onMessage(message));
@@ -1177,10 +1181,10 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
                 != ProcessingMode.BodySendMode.GRPC
             || dataPlaneServerCall.config.getObservabilityMode()) {
 
-          if (dataPlaneServerCall.dataPlaneCallState.get() == DataPlaneCallState.IDLE) {
-            // We must buffer because the application call hasn't started yet
+          if (del == null) {
+            // We must buffer because the application call hasn't started yet or delegate is not set
             savedMessages.add(message);
-          } else if (del != null) {
+          } else {
             dataPlaneServerCall.callContext.run(() -> del.onMessage(message));
           }
           return;
@@ -1201,6 +1205,9 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     @Override
     public void onHalfClose() {
       dataPlaneServerCall.delegateExecutor.execute(() -> {
+        if (dataPlaneServerCall.requestSideClosed.get()) {
+          return;
+        }
         dataPlaneServerCall.clientHalfCloseStartNanos = System.nanoTime();
         dataPlaneServerCall.halfClosed.set(true);
         ServerCall.Listener<InputStream> del = delegate;
@@ -1210,7 +1217,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
         }
 
         if (dataPlaneServerCall.dataPlaneCallState.get() == DataPlaneCallState.IDLE) {
-          halfCloseReceived = true;
+          halfCloseDeferred = true;
           return;
         }
 
@@ -1223,7 +1230,22 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       });
     }
 
+    void handleDeferredHalfClose() {
+      dataPlaneServerCall.delegateExecutor.execute(() -> {
+        if (dataPlaneServerCall.currentProcessingMode.getRequestBodyMode() == ProcessingMode.BodySendMode.NONE
+            || dataPlaneServerCall.isExtProcStreamCompleted()) {
+          proceedWithHalfClose();
+        } else {
+          sendRequestBodyToExtProc(null, true);
+        }
+      });
+    }
+
     void proceedWithHalfClose() {
+      if (!dataPlaneServerCall.requestSideClosed.compareAndSet(false, true)) {
+        return;
+      }
+      halfCloseReceived = true;
       if (dataPlaneServerCall.clientHalfCloseStartNanos > 0) {
         long durationNanos = System.nanoTime() - dataPlaneServerCall.clientHalfCloseStartNanos;
         dataPlaneServerCall.recordDuration(clientHalfCloseDuration, durationNanos);
@@ -1233,12 +1255,15 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       if (del != null) {
         dataPlaneServerCall.callContext.run(del::onHalfClose);
       }
+      dataPlaneServerCall.checkEndOfStream();
     }
 
     void onExternalBody(ByteString body) {
       ServerCall.Listener<InputStream> del = delegate;
       if (del != null) {
         dataPlaneServerCall.callContext.run(() -> del.onMessage(new InboundZeroCopyInputStream(body)));
+      } else {
+        savedMessages.add(new InboundZeroCopyInputStream(body));
       }
     }
 
@@ -1252,8 +1277,10 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       HttpBody.Builder bodyBuilder = HttpBody.newBuilder();
       if (bodyByteString != null) {
         bodyBuilder.setBody(bodyByteString);
+        bodyBuilder.setEndOfStream(endOfStream);
+      } else {
+        bodyBuilder.setEndOfStreamWithoutMessage(true);
       }
-      bodyBuilder.setEndOfStream(endOfStream);
 
       dataPlaneServerCall.sendToExtProc(ProcessingRequest.newBuilder()
           .setRequestBody(bodyBuilder.build())
