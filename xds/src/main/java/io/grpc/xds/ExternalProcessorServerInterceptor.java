@@ -319,6 +319,10 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     private volatile Status savedStatus;
     private volatile Metadata savedTrailers;
 
+    private boolean protocolConfigSent = false;
+    private ImmutableMap<String, Struct> collectedAttributes;
+    private boolean requestAttributesSent = false;
+
     private long clientHeadersStartNanos;
     private long clientHalfCloseStartNanos;
     private long serverHeadersStartNanos;
@@ -512,6 +516,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     void start() {
       clientHeadersStartNanos = System.nanoTime();
+      this.collectedAttributes = collectAttributes(
+          config.getRequestAttributes(), method, authority, requestHeaders);
 
       extProcStub.process(new ClientResponseObserver<ProcessingRequest, ProcessingResponse>() {
         @Override
@@ -660,12 +666,6 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
                 .setHeaders(toHeaderMap(requestHeaders, config.getForwardRulesConfig()))
                 .setEndOfStream(false)
                 .build())
-            .putAllAttributes(
-                collectAttributes(config.getRequestAttributes(), method, authority, requestHeaders))
-            .setProtocolConfig(ProtocolConfiguration.newBuilder()
-                .setRequestBodyMode(currentProcessingMode.getRequestBodyMode())
-                .setResponseBodyMode(currentProcessingMode.getResponseBodyMode())
-                .build())
             .build());
       }
 
@@ -679,20 +679,49 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
         if (isExtProcStreamCompleted()) {
           return;
         }
+
+        ProcessingRequest requestToSend = request;
+        if (!protocolConfigSent) {
+          requestToSend = ProcessingRequest.newBuilder(requestToSend)
+              .setProtocolConfig(ProtocolConfiguration.newBuilder()
+                  .setRequestBodyMode(currentProcessingMode.getRequestBodyMode())
+                  .setResponseBodyMode(currentProcessingMode.getResponseBodyMode())
+                  .build())
+              .build();
+          protocolConfigSent = true;
+        }
+
+        boolean isClientServerMessage =
+            requestToSend.hasRequestHeaders() || requestToSend.hasRequestBody();
+        if (isClientServerMessage
+            && !requestAttributesSent
+            && collectedAttributes != null
+            && !collectedAttributes.isEmpty()) {
+          requestToSend = ProcessingRequest.newBuilder(requestToSend)
+              .putAllAttributes(collectedAttributes)
+              .build();
+          requestAttributesSent = true;
+        }
+
+        if (config.getObservabilityMode()) {
+          requestToSend = ProcessingRequest.newBuilder(requestToSend)
+              .setObservabilityMode(true)
+              .build();
+        }
         
-        if (request.hasRequestHeaders()) {
+        if (requestToSend.hasRequestHeaders()) {
           expectedResponses.add(EventType.REQUEST_HEADERS);
-        } else if (request.hasRequestBody()) {
+        } else if (requestToSend.hasRequestBody()) {
           expectedResponses.add(EventType.REQUEST_BODY);
-        } else if (request.hasResponseHeaders()) {
+        } else if (requestToSend.hasResponseHeaders()) {
           expectedResponses.add(EventType.RESPONSE_HEADERS);
-        } else if (request.hasResponseBody()) {
+        } else if (requestToSend.hasResponseBody()) {
           expectedResponses.add(EventType.RESPONSE_BODY);
-        } else if (request.hasResponseTrailers()) {
+        } else if (requestToSend.hasResponseTrailers()) {
           expectedResponses.add(EventType.RESPONSE_TRAILERS);
         }
 
-        extProcClientCallRequestObserver.onNext(request);
+        extProcClientCallRequestObserver.onNext(requestToSend);
       }
     }
 

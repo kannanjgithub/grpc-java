@@ -271,14 +271,13 @@ public class ExternalProcessorFilter implements Filter {
   @Override
   public ClientInterceptor buildClientInterceptor(FilterConfig filterConfig,
       @Nullable FilterConfig overrideConfig, ScheduledExecutorService scheduler) {
-    ExternalProcessorFilterConfig extProcFilterConfig =
-        (ExternalProcessorFilterConfig) filterConfig;
-    if (overrideConfig != null) {
-      extProcFilterConfig = mergeConfigs(extProcFilterConfig,
-          (ExternalProcessorFilterOverrideConfig) overrideConfig);
-    }
-    return new ExternalProcessorInterceptor(
-        extProcFilterConfig, cachedChannelManager, scheduler, context);
+    return new ClientInterceptor() {
+      @Override
+      public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
+          MethodDescriptor<ReqT, RespT> method, CallOptions callOptions, Channel next) {
+        return next.newCall(method, callOptions);
+      }
+    };
   }
 
   @Nullable
