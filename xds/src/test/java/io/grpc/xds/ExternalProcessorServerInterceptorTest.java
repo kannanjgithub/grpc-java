@@ -4426,7 +4426,8 @@ public class ExternalProcessorServerInterceptorTest {
 
   @Test
   @SuppressWarnings("unchecked")
-  public void givenRequestDrainActive_whenIsReadyCalled_thenReturnsFalse() throws Exception {
+  public void givenObservabilityMode_whenClientBusy_thenIsReadyReturnsFalse()
+      throws Exception {
     String uniqueExtProcServerName = InProcessServerBuilder.generateName();
     ExternalProcessor proto = ExternalProcessor.newBuilder()
         .setGrpcService(GrpcService.newBuilder()
@@ -4438,13 +4439,14 @@ public class ExternalProcessorServerInterceptorTest {
                     .build())
                 .build())
             .build())
+        .setObservabilityMode(true)
         .build();
     ConfigOrError<ExternalProcessorFilterConfig> configOrError =
         provider.parseFilterConfig(Any.pack(proto), filterContext);
     assertThat(configOrError.errorDetail).isNull();
     ExternalProcessorFilterConfig filterConfig = configOrError.config;
 
-    final CountDownLatch drainLatch = new CountDownLatch(1);
+    // External Processor Server
     final AtomicReference<StreamObserver<ProcessingResponse>> responseObserverRef = new AtomicReference<>();
     ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
         new ExternalProcessorGrpc.ExternalProcessorImplBase() {
@@ -4459,14 +4461,12 @@ public class ExternalProcessorServerInterceptorTest {
               public void onNext(ProcessingRequest request) {
                 if (request.hasRequestHeaders()) {
                   responseObserver.onNext(ProcessingResponse.newBuilder()
-                      .setRequestDrain(true)
+                      .setRequestHeaders(HeadersResponse.newBuilder().build())
                       .build());
-                  drainLatch.countDown();
                 }
               }
-
               @Override public void onError(Throwable t) {}
-              @Override public void onCompleted() {}
+              @Override public void onCompleted() { responseObserver.onCompleted(); }
             };
           }
         };
@@ -4483,29 +4483,132 @@ public class ExternalProcessorServerInterceptorTest {
     ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
         filterConfig, channelManager, FAKE_CONTEXT);
 
-    final AtomicReference<ServerCall<InputStream, InputStream>> interceptedCallRef = new AtomicReference<>();
-    ServerCallHandler<InputStream, InputStream> nextHandler = (call, headers) -> {
-      interceptedCallRef.set(call);
-      return new ServerCall.Listener<InputStream>() {};
+    final AtomicBoolean clientReady = new AtomicBoolean(true);
+    ServerCall<InputStream, InputStream> rawCall = new SimpleServerCall(METHOD_SAY_HELLO_RAW) {
+      @Override
+      public boolean isReady() {
+        return clientReady.get();
+      }
     };
 
+    final AtomicReference<ServerCall<InputStream, InputStream>> interceptedCallRef = new AtomicReference<>();
     try {
-      interceptor.interceptCall(new SimpleServerCall(METHOD_SAY_HELLO_RAW), new Metadata(), nextHandler);
+      interceptor.interceptCall(rawCall, new Metadata(), (call, headers) -> {
+        interceptedCallRef.set(call);
+        return new ServerCall.Listener<InputStream>() {};
+      });
 
-      assertThat(drainLatch.await(5, TimeUnit.SECONDS)).isTrue();
-
-      // isReady() must return false during drain.
-      long start = System.currentTimeMillis();
-      while (interceptedCallRef.get().isReady() && System.currentTimeMillis() - start < 2000) {
+      // Wait for activation (sidecar needs to respond to headers)
+      long startTime = System.currentTimeMillis();
+      while (interceptedCallRef.get() == null && System.currentTimeMillis() - startTime < 5000) {
         Thread.sleep(10);
       }
+      assertThat(interceptedCallRef.get()).isNotNull();
+      assertThat(interceptedCallRef.get().isReady()).isTrue();
+
+      // Client becomes busy
+      clientReady.set(false);
       assertThat(interceptedCallRef.get().isReady()).isFalse();
     } finally {
       if (responseObserverRef.get() != null) {
         try {
           responseObserverRef.get().onCompleted();
         } catch (IllegalStateException ignored) {
-          // Ignore if already closed
+        }
+      }
+      channelManager.close();
+    }
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
+  public void givenNormalMode_whenClientBusy_thenIsReadyReturnsTrue()
+      throws Exception {
+    String uniqueExtProcServerName = InProcessServerBuilder.generateName();
+    ExternalProcessor proto = ExternalProcessor.newBuilder()
+        .setGrpcService(GrpcService.newBuilder()
+            .setGoogleGrpc(GrpcService.GoogleGrpc.newBuilder()
+                .setTargetUri("in-process:///" + uniqueExtProcServerName)
+                .addChannelCredentialsPlugin(Any.newBuilder()
+                    .setTypeUrl("type.googleapis.com/envoy.extensions.grpc_service." 
+                        + "channel_credentials.insecure.v3.InsecureCredentials")
+                    .build())
+                .build())
+            .build())
+        .setObservabilityMode(false)
+        .build();
+    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
+        provider.parseFilterConfig(Any.pack(proto), filterContext);
+    assertThat(configOrError.errorDetail).isNull();
+    ExternalProcessorFilterConfig filterConfig = configOrError.config;
+
+    // External Processor Server
+    final AtomicReference<StreamObserver<ProcessingResponse>> responseObserverRef = new AtomicReference<>();
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          @SuppressWarnings("unchecked")
+          public StreamObserver<ProcessingRequest> process(
+              final StreamObserver<ProcessingResponse> responseObserver) {
+            responseObserverRef.set(responseObserver);
+            ((ServerCallStreamObserver<ProcessingResponse>) responseObserver).request(100);
+            return new StreamObserver<ProcessingRequest>() {
+              @Override
+              public void onNext(ProcessingRequest request) {
+                if (request.hasRequestHeaders()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setRequestHeaders(HeadersResponse.newBuilder().build())
+                      .build());
+                }
+              }
+              @Override public void onError(Throwable t) {}
+              @Override public void onCompleted() { responseObserver.onCompleted(); }
+            };
+          }
+        };
+    grpcCleanup.register(InProcessServerBuilder.forName(uniqueExtProcServerName)
+        .addService(extProcImpl)
+        .directExecutor()
+        .build().start());
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(uniqueExtProcServerName).directExecutor().build());
+    });
+
+    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
+        filterConfig, channelManager, FAKE_CONTEXT);
+
+    final AtomicBoolean clientReady = new AtomicBoolean(false);
+    ServerCall<InputStream, InputStream> rawCall = new SimpleServerCall(METHOD_SAY_HELLO_RAW) {
+      @Override
+      public boolean isReady() {
+        return clientReady.get();
+      }
+    };
+
+    final AtomicReference<ServerCall<InputStream, InputStream>> interceptedCallRef = new AtomicReference<>();
+    try {
+      interceptor.interceptCall(rawCall, new Metadata(), (call, headers) -> {
+        interceptedCallRef.set(call);
+        return new ServerCall.Listener<InputStream>() {};
+      });
+
+      // Wait for activation (sidecar needs to respond to headers)
+      long startTime = System.currentTimeMillis();
+      while (interceptedCallRef.get() == null && System.currentTimeMillis() - startTime < 5000) {
+        Thread.sleep(10);
+      }
+      assertThat(interceptedCallRef.get()).isNotNull();
+      
+      // Since sidecar is ready, interceptedCallRef.get().isReady() should return true,
+      // ignoring that client (rawCall) is busy
+      assertThat(interceptedCallRef.get().isReady()).isTrue();
+    } finally {
+      if (responseObserverRef.get() != null) {
+        try {
+          responseObserverRef.get().onCompleted();
+        } catch (IllegalStateException ignored) {
         }
       }
       channelManager.close();
@@ -4622,9 +4725,638 @@ public class ExternalProcessorServerInterceptorTest {
     }
   }
 
+  // ============================================================================
+  // Category 12: Ext-proc request draining
+  // ============================================================================
+
+  @Test
+  @SuppressWarnings("unchecked")
+  public void givenRequestDrainActive_whenIsReadyCalled_thenReturnsFalse() throws Exception {
+    String uniqueExtProcServerName = InProcessServerBuilder.generateName();
+    ExternalProcessor proto = ExternalProcessor.newBuilder()
+        .setGrpcService(GrpcService.newBuilder()
+            .setGoogleGrpc(GrpcService.GoogleGrpc.newBuilder()
+                .setTargetUri("in-process:///" + uniqueExtProcServerName)
+                .addChannelCredentialsPlugin(Any.newBuilder()
+                    .setTypeUrl("type.googleapis.com/envoy.extensions.grpc_service." 
+                        + "channel_credentials.insecure.v3.InsecureCredentials")
+                    .build())
+                .build())
+            .build())
+        .build();
+    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
+        provider.parseFilterConfig(Any.pack(proto), filterContext);
+    assertThat(configOrError.errorDetail).isNull();
+    ExternalProcessorFilterConfig filterConfig = configOrError.config;
+
+    final CountDownLatch drainLatch = new CountDownLatch(1);
+    final AtomicReference<StreamObserver<ProcessingResponse>> responseObserverRef = new AtomicReference<>();
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          @SuppressWarnings("unchecked")
+          public StreamObserver<ProcessingRequest> process(
+              final StreamObserver<ProcessingResponse> responseObserver) {
+            responseObserverRef.set(responseObserver);
+            ((ServerCallStreamObserver<ProcessingResponse>) responseObserver).request(100);
+            return new StreamObserver<ProcessingRequest>() {
+              @Override
+              public void onNext(ProcessingRequest request) {
+                if (request.hasRequestHeaders()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setRequestDrain(true)
+                      .build());
+                  drainLatch.countDown();
+                }
+              }
+
+              @Override public void onError(Throwable t) {}
+              @Override public void onCompleted() {}
+            };
+          }
+        };
+    grpcCleanup.register(InProcessServerBuilder.forName(uniqueExtProcServerName)
+        .addService(extProcImpl)
+        .directExecutor()
+        .build().start());
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(uniqueExtProcServerName).directExecutor().build());
+    });
+
+    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
+        filterConfig, channelManager, FAKE_CONTEXT);
+
+    final AtomicReference<ServerCall<InputStream, InputStream>> interceptedCallRef = new AtomicReference<>();
+    ServerCallHandler<InputStream, InputStream> nextHandler = (call, headers) -> {
+      interceptedCallRef.set(call);
+      return new ServerCall.Listener<InputStream>() {};
+    };
+
+    try {
+      interceptor.interceptCall(new SimpleServerCall(METHOD_SAY_HELLO_RAW), new Metadata(), nextHandler);
+
+      assertThat(drainLatch.await(5, TimeUnit.SECONDS)).isTrue();
+
+      // isReady() must return false during drain.
+      long start = System.currentTimeMillis();
+      while (interceptedCallRef.get().isReady() && System.currentTimeMillis() - start < 2000) {
+        Thread.sleep(10);
+      }
+      assertThat(interceptedCallRef.get().isReady()).isFalse();
+    } finally {
+      if (responseObserverRef.get() != null) {
+        try {
+          responseObserverRef.get().onCompleted();
+        } catch (IllegalStateException ignored) {
+          // Ignore if already closed
+        }
+      }
+      channelManager.close();
+    }
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
+  public void givenDrainingStream_whenExtProcStreamCompletes_thenOnReady() throws Exception {
+    String uniqueExtProcServerName = InProcessServerBuilder.generateName();
+    ExternalProcessor proto = ExternalProcessor.newBuilder()
+        .setGrpcService(GrpcService.newBuilder()
+            .setGoogleGrpc(GrpcService.GoogleGrpc.newBuilder()
+                .setTargetUri("in-process:///" + uniqueExtProcServerName)
+                .addChannelCredentialsPlugin(Any.newBuilder()
+                    .setTypeUrl("type.googleapis.com/envoy.extensions.grpc_service." 
+                        + "channel_credentials.insecure.v3.InsecureCredentials")
+                    .build())
+                .build())
+            .build())
+        .build();
+    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
+        provider.parseFilterConfig(Any.pack(proto), filterContext);
+    assertThat(configOrError.errorDetail).isNull();
+    ExternalProcessorFilterConfig filterConfig = configOrError.config;
+
+    final CountDownLatch sidecarFinishLatch = new CountDownLatch(1);
+    final CountDownLatch sidecarOnNextLatch = new CountDownLatch(1);
+    final CountDownLatch sidecarOnCompletedLatch = new CountDownLatch(1);
+    final AtomicReference<StreamObserver<ProcessingResponse>> responseObserverRef = new AtomicReference<>();
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          @SuppressWarnings("unchecked")
+          public StreamObserver<ProcessingRequest> process(
+              final StreamObserver<ProcessingResponse> responseObserver) {
+            responseObserverRef.set(responseObserver);
+            ((ServerCallStreamObserver<ProcessingResponse>) responseObserver).request(100);
+            return new StreamObserver<ProcessingRequest>() {
+              @Override
+              public void onNext(ProcessingRequest request) {
+                if (request.hasRequestHeaders()) {
+                  new Thread(() -> {
+                    responseObserver.onNext(ProcessingResponse.newBuilder()
+                        .setRequestDrain(true)
+                        .build());
+                    sidecarOnNextLatch.countDown();
+                    try {
+                      if (sidecarFinishLatch.await(5, TimeUnit.SECONDS)) {
+                        sidecarOnCompletedLatch.countDown();
+                        responseObserver.onCompleted();
+                      }
+                    } catch (InterruptedException e) {
+                      Thread.currentThread().interrupt();
+                    }
+                  }).start();
+                }
+              }
+
+              @Override public void onError(Throwable t) {}
+              @Override public void onCompleted() {}
+            };
+          }
+        };
+    grpcCleanup.register(InProcessServerBuilder.forName(uniqueExtProcServerName)
+        .addService(extProcImpl)
+        .directExecutor()
+        .build().start());
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(uniqueExtProcServerName).directExecutor().build());
+    });
+
+    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
+        filterConfig, channelManager, FAKE_CONTEXT);
+
+    final CountDownLatch onReadyLatch = new CountDownLatch(1);
+    ServerCall.Listener<InputStream> appListener = new ServerCall.Listener<InputStream>() {
+      @Override
+      public void onReady() {
+        onReadyLatch.countDown();
+      }
+    };
+
+    final AtomicReference<ServerCall<InputStream, InputStream>> interceptedCallRef = new AtomicReference<>();
+    ServerCall<InputStream, InputStream> rawCall = new SimpleServerCall(METHOD_SAY_HELLO_RAW) {
+      @Override
+      public boolean isReady() {
+        return true;
+      }
+    };
+
+    try {
+      interceptor.interceptCall(rawCall, new Metadata(), (call, headers) -> {
+        interceptedCallRef.set(call);
+        return appListener;
+      });
+
+      // Wait for sidecar to send drain and test to observe it
+      assertThat(sidecarOnNextLatch.await(5, TimeUnit.SECONDS)).isTrue();
+      
+      long start = System.currentTimeMillis();
+      while (interceptedCallRef.get() == null && System.currentTimeMillis() - start < 2000) {
+        Thread.sleep(10);
+      }
+      assertThat(interceptedCallRef.get()).isNotNull();
+      assertThat(interceptedCallRef.get().isReady()).isFalse();
+
+      // Now let sidecar complete
+      sidecarFinishLatch.countDown();
+
+      assertThat(sidecarOnCompletedLatch.await(5, TimeUnit.SECONDS)).isTrue();
+
+      // After sidecar stream completes, it should trigger onReady and become ready
+      assertThat(onReadyLatch.await(5, TimeUnit.SECONDS)).isTrue();
+      assertThat(interceptedCallRef.get().isReady()).isTrue();
+    } finally {
+      if (responseObserverRef.get() != null) {
+        try {
+          responseObserverRef.get().onCompleted();
+        } catch (IllegalStateException ignored) {}
+      }
+      channelManager.close();
+    }
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
+  public void givenDrainingStream_whenExtProcStreamCompletes_thenMessagesProceed()
+      throws Exception {
+    String uniqueExtProcServerName = InProcessServerBuilder.generateName();
+    ExternalProcessor proto = ExternalProcessor.newBuilder()
+        .setGrpcService(GrpcService.newBuilder()
+            .setGoogleGrpc(GrpcService.GoogleGrpc.newBuilder()
+                .setTargetUri("in-process:///" + uniqueExtProcServerName)
+                .addChannelCredentialsPlugin(Any.newBuilder()
+                    .setTypeUrl("type.googleapis.com/envoy.extensions.grpc_service." 
+                        + "channel_credentials.insecure.v3.InsecureCredentials")
+                    .build())
+                .build())
+            .build())
+        .build();
+    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
+        provider.parseFilterConfig(Any.pack(proto), filterContext);
+    assertThat(configOrError.errorDetail).isNull();
+    ExternalProcessorFilterConfig filterConfig = configOrError.config;
+
+    // External Processor Server
+    final CountDownLatch sidecarFinishLatch = new CountDownLatch(1);
+    final AtomicReference<StreamObserver<ProcessingResponse>> responseObserverRef = new AtomicReference<>();
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          @SuppressWarnings("unchecked")
+          public StreamObserver<ProcessingRequest> process(
+              final StreamObserver<ProcessingResponse> responseObserver) {
+            responseObserverRef.set(responseObserver);
+            ((ServerCallStreamObserver<ProcessingResponse>) responseObserver).request(100);
+            return new StreamObserver<ProcessingRequest>() {
+              @Override
+              public void onNext(ProcessingRequest request) {
+                if (request.hasRequestHeaders()) {
+                  new Thread(() -> {
+                    responseObserver.onNext(ProcessingResponse.newBuilder()
+                        .setRequestDrain(true)
+                        .build());
+                    try {
+                      if (sidecarFinishLatch.await(5, TimeUnit.SECONDS)) {
+                        responseObserver.onCompleted();
+                      }
+                    } catch (InterruptedException e) {
+                      Thread.currentThread().interrupt();
+                    }
+                  }).start();
+                }
+              }
+
+              @Override public void onError(Throwable t) {}
+              @Override public void onCompleted() {}
+            };
+          }
+        };
+    grpcCleanup.register(InProcessServerBuilder.forName(uniqueExtProcServerName)
+        .addService(extProcImpl)
+        .directExecutor()
+        .build().start());
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(uniqueExtProcServerName).directExecutor().build());
+    });
+
+    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
+        filterConfig, channelManager, FAKE_CONTEXT);
+
+    final List<String> serverReceivedMessages = new java.util.concurrent.CopyOnWriteArrayList<>();
+    final CountDownLatch appMessageLatch = new CountDownLatch(1);
+    ServerCall.Listener<InputStream> appListener = new ServerCall.Listener<InputStream>() {
+      @Override
+      public void onMessage(InputStream message) {
+        try {
+          serverReceivedMessages.add(new String(ByteStreams.toByteArray(message), StandardCharsets.UTF_8));
+          appMessageLatch.countDown();
+        } catch (IOException e) {
+          throw new RuntimeException(e);
+        }
+      }
+    };
+
+    final AtomicReference<ServerCall<InputStream, InputStream>> interceptedCallRef = new AtomicReference<>();
+    final List<InputStream> rawSentMessages = new java.util.concurrent.CopyOnWriteArrayList<>();
+    final CountDownLatch rawSentLatch = new CountDownLatch(1);
+    ServerCall<InputStream, InputStream> rawCall = new SimpleServerCall(METHOD_SAY_HELLO_RAW) {
+      @Override
+      public void sendMessage(InputStream message) {
+        rawSentMessages.add(message);
+        rawSentLatch.countDown();
+      }
+      @Override
+      public boolean isReady() {
+        return true;
+      }
+    };
+
+    try {
+      ServerCall.Listener<InputStream> interceptedListener =
+          interceptor.interceptCall(rawCall, new Metadata(), (call, headers) -> {
+            interceptedCallRef.set(call);
+            return appListener;
+          });
+
+      // Wait for drain to be processed
+      long start = System.currentTimeMillis();
+      while ((interceptedCallRef.get() == null || interceptedCallRef.get().isReady()) 
+          && System.currentTimeMillis() - start < 5000) {
+        Thread.sleep(10);
+      }
+      assertThat(interceptedCallRef.get().isReady()).isFalse();
+
+      // Now let sidecar complete
+      sidecarFinishLatch.countDown();
+
+      // Wait for it to become ready again
+      start = System.currentTimeMillis();
+      while (!interceptedCallRef.get().isReady() && System.currentTimeMillis() - start < 5000) {
+        Thread.sleep(10);
+      }
+      assertThat(interceptedCallRef.get().isReady()).isTrue();
+
+      // 1. Verify client message is delivered to app listener without sidecar contact
+      interceptedListener.onMessage(new ByteArrayInputStream("hello".getBytes(StandardCharsets.UTF_8)));
+      assertThat(appMessageLatch.await(5, TimeUnit.SECONDS)).isTrue();
+      assertThat(serverReceivedMessages).containsExactly("hello");
+
+      // 2. Verify server app response message is sent to client without sidecar contact
+      interceptedCallRef.get().sendMessage(new ByteArrayInputStream("response".getBytes(StandardCharsets.UTF_8)));
+      assertThat(rawSentLatch.await(5, TimeUnit.SECONDS)).isTrue();
+      assertThat(new String(ByteStreams.toByteArray(rawSentMessages.get(0)), StandardCharsets.UTF_8)).isEqualTo("response");
+    } finally {
+      if (responseObserverRef.get() != null) {
+        try {
+          responseObserverRef.get().onCompleted();
+        } catch (IllegalStateException ignored) {}
+      }
+      channelManager.close();
+    }
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
+  public void givenDrainingStream_whenAppSends_thenBufferedAndDelivered()
+      throws Exception {
+    String uniqueExtProcServerName = InProcessServerBuilder.generateName();
+    ExternalProcessor proto = ExternalProcessor.newBuilder()
+        .setGrpcService(GrpcService.newBuilder()
+            .setGoogleGrpc(GrpcService.GoogleGrpc.newBuilder()
+                .setTargetUri("in-process:///" + uniqueExtProcServerName)
+                .addChannelCredentialsPlugin(Any.newBuilder()
+                    .setTypeUrl("type.googleapis.com/envoy.extensions.grpc_service." 
+                        + "channel_credentials.insecure.v3.InsecureCredentials")
+                    .build())
+                .build())
+            .build())
+        .setProcessingMode(ProcessingMode.newBuilder()
+            .setResponseBodyMode(ProcessingMode.BodySendMode.GRPC)
+            .setResponseTrailerMode(ProcessingMode.HeaderSendMode.SEND)
+            .build())
+        .build();
+    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
+        provider.parseFilterConfig(Any.pack(proto), filterContext);
+    assertThat(configOrError.errorDetail).isNull();
+    ExternalProcessorFilterConfig filterConfig = configOrError.config;
+
+    // External Processor Server
+    final CountDownLatch sidecarFinishLatch = new CountDownLatch(1);
+    final CountDownLatch drainCompletedLatch = new CountDownLatch(1);
+    final AtomicInteger extProcReceivedBodyCount = new AtomicInteger(0);
+    final AtomicReference<StreamObserver<ProcessingResponse>> responseObserverRef = new AtomicReference<>();
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          @SuppressWarnings("unchecked")
+          public StreamObserver<ProcessingRequest> process(
+              final StreamObserver<ProcessingResponse> responseObserver) {
+            responseObserverRef.set(responseObserver);
+            ((ServerCallStreamObserver<ProcessingResponse>) responseObserver).request(100);
+            return new StreamObserver<ProcessingRequest>() {
+              @Override
+              public void onNext(ProcessingRequest request) {
+                if (request.hasRequestHeaders()) {
+                  new Thread(() -> {
+                    responseObserver.onNext(ProcessingResponse.newBuilder()
+                        .setRequestDrain(true)
+                        .build());
+                    try {
+                      if (sidecarFinishLatch.await(5, TimeUnit.SECONDS)) {
+                        responseObserver.onCompleted();
+                      }
+                    } catch (InterruptedException e) {
+                      Thread.currentThread().interrupt();
+                    }
+                  }).start();
+                } else if (request.hasResponseBody()) {
+                  extProcReceivedBodyCount.incrementAndGet();
+                }
+              }
+
+              @Override public void onError(Throwable t) {}
+              @Override
+              public void onCompleted() {
+                drainCompletedLatch.countDown();
+              }
+            };
+          }
+        };
+    grpcCleanup.register(InProcessServerBuilder.forName(uniqueExtProcServerName)
+        .addService(extProcImpl)
+        .directExecutor()
+        .build().start());
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(uniqueExtProcServerName).directExecutor().build());
+    });
+
+    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
+        filterConfig, channelManager, FAKE_CONTEXT);
+
+    final AtomicReference<ServerCall<InputStream, InputStream>> interceptedCallRef = new AtomicReference<>();
+    final List<InputStream> rawSentMessages = new java.util.concurrent.CopyOnWriteArrayList<>();
+    final CountDownLatch rawSentLatch = new CountDownLatch(1);
+    ServerCall<InputStream, InputStream> rawCall = new SimpleServerCall(METHOD_SAY_HELLO_RAW) {
+      @Override
+      public void sendMessage(InputStream message) {
+        rawSentMessages.add(message);
+        rawSentLatch.countDown();
+      }
+      @Override
+      public boolean isReady() {
+        return true;
+      }
+    };
+
+    try {
+      interceptor.interceptCall(rawCall, new Metadata(), (call, headers) -> {
+        interceptedCallRef.set(call);
+        return new ServerCall.Listener<InputStream>() {};
+      });
+
+      // Wait for drain to be processed
+      assertThat(drainCompletedLatch.await(5, TimeUnit.SECONDS)).isTrue();
+      assertThat(interceptedCallRef.get().isReady()).isFalse();
+
+      // Send response message during drain state
+      interceptedCallRef.get().sendMessage(new ByteArrayInputStream("response message during drain".getBytes(StandardCharsets.UTF_8)));
+
+      // Assert that it was NOT received by extProc
+      assertThat(extProcReceivedBodyCount.get()).isEqualTo(0);
+      // Assert that it was NOT sent to the client rawCall
+      assertThat(rawSentMessages).isEmpty();
+
+      // Now let sidecar complete
+      sidecarFinishLatch.countDown();
+
+      // Wait for it to become ready again
+      long startTime = System.currentTimeMillis();
+      while (!interceptedCallRef.get().isReady() && System.currentTimeMillis() - startTime < 5000) {
+        Thread.sleep(10);
+      }
+      assertThat(interceptedCallRef.get().isReady()).isTrue();
+
+      // Assert that the message sent during drain is received by the client (raw call)
+      assertThat(rawSentLatch.await(5, TimeUnit.SECONDS)).isTrue();
+      assertThat(new String(ByteStreams.toByteArray(rawSentMessages.get(0)), StandardCharsets.UTF_8))
+          .isEqualTo("response message during drain");
+    } finally {
+      if (responseObserverRef.get() != null) {
+        try {
+          responseObserverRef.get().onCompleted();
+        } catch (IllegalStateException ignored) {}
+      }
+      channelManager.close();
+    }
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
+  public void givenDrainingStream_whenClientResponds_thenBufferedAndDelivered()
+      throws Exception {
+    String uniqueExtProcServerName = InProcessServerBuilder.generateName();
+    ExternalProcessor proto = ExternalProcessor.newBuilder()
+        .setGrpcService(GrpcService.newBuilder()
+            .setGoogleGrpc(GrpcService.GoogleGrpc.newBuilder()
+                .setTargetUri("in-process:///" + uniqueExtProcServerName)
+                .addChannelCredentialsPlugin(Any.newBuilder()
+                    .setTypeUrl("type.googleapis.com/envoy.extensions.grpc_service." 
+                        + "channel_credentials.insecure.v3.InsecureCredentials")
+                    .build())
+                .build())
+            .build())
+        .setProcessingMode(ProcessingMode.newBuilder()
+            .setRequestBodyMode(ProcessingMode.BodySendMode.GRPC)
+            .build())
+        .build();
+    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
+        provider.parseFilterConfig(Any.pack(proto), filterContext);
+    assertThat(configOrError.errorDetail).isNull();
+    ExternalProcessorFilterConfig filterConfig = configOrError.config;
+
+    // External Processor Server
+    final CountDownLatch sidecarFinishLatch = new CountDownLatch(1);
+    final CountDownLatch drainCompletedLatch = new CountDownLatch(1);
+    final AtomicReference<StreamObserver<ProcessingResponse>> responseObserverRef = new AtomicReference<>();
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          @SuppressWarnings("unchecked")
+          public StreamObserver<ProcessingRequest> process(
+              final StreamObserver<ProcessingResponse> responseObserver) {
+            responseObserverRef.set(responseObserver);
+            ((ServerCallStreamObserver<ProcessingResponse>) responseObserver).request(100);
+            return new StreamObserver<ProcessingRequest>() {
+              @Override
+              public void onNext(ProcessingRequest request) {
+                if (request.hasRequestHeaders()) {
+                  new Thread(() -> {
+                    responseObserver.onNext(ProcessingResponse.newBuilder()
+                        .setRequestDrain(true)
+                        .build());
+                    try {
+                      if (sidecarFinishLatch.await(5, TimeUnit.SECONDS)) {
+                        responseObserver.onCompleted();
+                      }
+                    } catch (InterruptedException e) {
+                      Thread.currentThread().interrupt();
+                    }
+                  }).start();
+                }
+              }
+
+              @Override public void onError(Throwable t) {}
+              @Override
+              public void onCompleted() {
+                drainCompletedLatch.countDown();
+              }
+            };
+          }
+        };
+    grpcCleanup.register(InProcessServerBuilder.forName(uniqueExtProcServerName)
+        .addService(extProcImpl)
+        .directExecutor()
+        .build().start());
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(uniqueExtProcServerName).directExecutor().build());
+    });
+
+    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
+        filterConfig, channelManager, FAKE_CONTEXT);
+
+    final List<String> serverReceivedMessages = new java.util.concurrent.CopyOnWriteArrayList<>();
+    final CountDownLatch appMessageLatch = new CountDownLatch(1);
+    ServerCall.Listener<InputStream> appListener = new ServerCall.Listener<InputStream>() {
+      @Override
+      public void onMessage(InputStream message) {
+        try {
+          serverReceivedMessages.add(new String(ByteStreams.toByteArray(message), StandardCharsets.UTF_8));
+          appMessageLatch.countDown();
+        } catch (IOException e) {
+          throw new RuntimeException(e);
+        }
+      }
+    };
+
+    final AtomicReference<ServerCall<InputStream, InputStream>> interceptedCallRef = new AtomicReference<>();
+    ServerCall<InputStream, InputStream> rawCall = new SimpleServerCall(METHOD_SAY_HELLO_RAW) {
+      @Override
+      public boolean isReady() {
+        return true;
+      }
+    };
+
+    try {
+      ServerCall.Listener<InputStream> interceptedListener =
+          interceptor.interceptCall(rawCall, new Metadata(), (call, headers) -> {
+            interceptedCallRef.set(call);
+            return appListener;
+          });
+
+      // Wait for drain to be processed
+      assertThat(drainCompletedLatch.await(5, TimeUnit.SECONDS)).isTrue();
+      assertThat(interceptedCallRef.get().isReady()).isFalse();
+
+      // Client sends request message during drain state
+      interceptedListener.onMessage(new ByteArrayInputStream("client message during drain".getBytes(StandardCharsets.UTF_8)));
+
+      // Verify app listener has NOT received the message yet because the drain is active
+      assertThat(serverReceivedMessages).isEmpty();
+
+      // Now let sidecar complete
+      sidecarFinishLatch.countDown();
+
+      // Wait for it to become ready again
+      long startTime = System.currentTimeMillis();
+      while (!interceptedCallRef.get().isReady() && System.currentTimeMillis() - startTime < 5000) {
+        Thread.sleep(10);
+      }
+      assertThat(interceptedCallRef.get().isReady()).isTrue();
+
+      // Verify that the buffered client request message is now delivered to the app
+      assertThat(appMessageLatch.await(5, TimeUnit.SECONDS)).isTrue();
+      assertThat(serverReceivedMessages).containsExactly("client message during drain");
+    } finally {
+      if (responseObserverRef.get() != null) {
+        try {
+          responseObserverRef.get().onCompleted();
+        } catch (IllegalStateException ignored) {}
+      }
+      channelManager.close();
+    }
+  }
 
   // ============================================================================
-  // Category 12: Inbound Backpressure (request(n) / pendingRequests)
+  // Category 13: Inbound Backpressure (request(n) / pendingRequests)
   // ============================================================================
 
   @Test
@@ -4890,7 +5622,7 @@ public class ExternalProcessorServerInterceptorTest {
 
 
   // ============================================================================
-  // Category 13: Error Handling & Security
+  // Category 14: Error Handling & Security
   // ============================================================================
 
   @Test
@@ -5036,7 +5768,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 14: Immediate Response Handling
+  // Category 15: Immediate Response Handling
   // ============================================================================
 
   @Test
@@ -5377,7 +6109,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 15: Resource Management
+  // Category 16: Resource Management
   // ============================================================================
 
   @Test
@@ -5389,7 +6121,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 16: Data plane rpc cancellation
+  // Category 17: Data plane rpc cancellation
   // ============================================================================
 
   @Test
@@ -5470,7 +6202,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 17: Flow Control when side stream is full
+  // Category 18: Flow Control when side stream is full
   // ============================================================================
 
   @Test
@@ -5751,7 +6483,7 @@ public class ExternalProcessorServerInterceptorTest {
 
 
   // ============================================================================
-  // Category 18: Streaming Completeness (Client & Bi-Di)
+  // Category 19: Streaming Completeness (Client & Bi-Di)
   // ============================================================================
 
   @Test
@@ -5951,7 +6683,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 19: Header Forwarding Rules
+  // Category 20: Header Forwarding Rules
   // ============================================================================
 
   @Test
@@ -6382,7 +7114,7 @@ public class ExternalProcessorServerInterceptorTest {
 
 
   // ============================================================================
-  // Category 20: Response Trailers
+  // Category 21: Response Trailers
   // ============================================================================
 
   @Test
@@ -6589,7 +7321,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 21: Response Ordering Checks
+  // Category 22: Response Ordering Checks
   // ============================================================================
 
   @Test
@@ -6784,7 +7516,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 22: Header Response Status Checks
+  // Category 23: Header Response Status Checks
   // ============================================================================
 
   @Test
@@ -6968,7 +7700,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 23: Concurrency and Thread Safety (Serialization)
+  // Category 24: Concurrency and Thread Safety (Serialization)
   // ============================================================================
 
   private static class ConcurrencyDetectingServerCall extends io.grpc.ForwardingServerCall.SimpleForwardingServerCall<InputStream, InputStream> {
@@ -7450,7 +8182,7 @@ public class ExternalProcessorServerInterceptorTest {
     assertThat(rawCall.concurrentCallDetected.get()).isFalse();
   }
 
-  // Category 24: Request-Scoped Context Propagation
+  // Category 25: Request-Scoped Context Propagation
   @Test
   public void serverInterceptor_contextPropagatedToStartCall() throws Exception {
     ExternalProcessor proto = createBaseProto(extProcServerName).build();

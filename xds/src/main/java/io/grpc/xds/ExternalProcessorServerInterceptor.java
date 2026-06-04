@@ -1146,6 +1146,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     void unblockAfterStreamComplete() {
       proceedWithSendHeaders();
       drainPendingDrainingMessages();
+      wrappedListener.drainSavedMessages();
+      wrappedListener.onReadyNotify();
       proceedWithClose();
     }
   }
@@ -1170,9 +1172,26 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
             delegate.onMessage(msg);
           }
           if (halfCloseReceived) {
-            delegate.onHalfClose();
+            proceedWithHalfClose();
           }
         });
+      });
+    }
+
+    void drainSavedMessages() {
+      dataPlaneServerCall.delegateExecutor.execute(() -> {
+        ServerCall.Listener<InputStream> del = delegate;
+        if (del != null) {
+          dataPlaneServerCall.callContext.run(() -> {
+            InputStream msg;
+            while ((msg = savedMessages.poll()) != null) {
+              del.onMessage(msg);
+            }
+            if (halfCloseReceived) {
+              proceedWithHalfClose();
+            }
+          });
+        }
       });
     }
 
@@ -1204,14 +1223,17 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
         }
 
         // If control stream is finished, or request body processing is disabled,
-        // or observability mode is enabled (which ignores mutations):
+        // or observability mode is enabled (which ignores mutations)
+        // OR the stream is in DRAINING state:
         if (dataPlaneServerCall.isExtProcStreamCompleted()
+            || dataPlaneServerCall.isExtProcStreamDraining()
             || dataPlaneServerCall.currentProcessingMode.getRequestBodyMode()
                 != ProcessingMode.BodySendMode.GRPC
             || dataPlaneServerCall.config.getObservabilityMode()) {
 
-          if (del == null) {
-            // We must buffer because the application call hasn't started yet or delegate is not set
+          if (del == null || dataPlaneServerCall.isExtProcStreamDraining()) {
+            // We must buffer because the application call hasn't started yet, delegate is not set,
+            // or the stream is draining.
             savedMessages.add(message);
           } else {
             dataPlaneServerCall.callContext.run(() -> del.onMessage(message));
@@ -1239,6 +1261,10 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
         }
         dataPlaneServerCall.clientHalfCloseStartNanos = System.nanoTime();
         dataPlaneServerCall.halfClosed.set(true);
+        if (dataPlaneServerCall.isExtProcStreamDraining()) {
+          halfCloseReceived = true;
+          return;
+        }
         ServerCall.Listener<InputStream> del = delegate;
         if ((dataPlaneServerCall.passThroughMode.get() || dataPlaneServerCall.isExtProcStreamCompleted()) && del != null) {
           proceedWithHalfClose();
