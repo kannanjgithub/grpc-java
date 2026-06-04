@@ -4020,7 +4020,8 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   @Test
-  public void extProcRespondsWithEosWithoutMessage_whenClientNotHalfClosed_thenAppListenerReceivesHalfClose()
+  public void
+      extProcEosNoMsg_whenClientNotHalfClosed_thenAppHalfClosed_moreMessagesDiscarded()
       throws Exception {
     ExternalProcessor proto = createBaseProto(extProcServerName)
         .setProcessingMode(ProcessingMode.newBuilder()
@@ -4157,7 +4158,8 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   @Test
-  public void givenExtProcRespondsWithEndOfStream_whenClientHasNotHalfClosed_thenAppListenerReceivesHalfClose()
+  public void
+      extProcEos_whenClientNotHalfClosed_thenAppHalfClosed_moreMessagesDiscarded()
       throws Exception {
     ExternalProcessor proto = createBaseProto(extProcServerName)
         .setProcessingMode(ProcessingMode.newBuilder()
