@@ -339,6 +339,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     final AtomicBoolean isProcessingTrailers = new AtomicBoolean(false);
     final AtomicBoolean responseHeadersSent = new AtomicBoolean(false);
+    final AtomicBoolean trailersOnly = new AtomicBoolean(false);
     final AtomicBoolean terminationTriggered = new AtomicBoolean(false);
 
     protected DataPlaneServerCall(
@@ -608,9 +609,14 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
                   return;
                 }
                 applyHeaderMutations(
-                    savedResponseHeaders, response.getResponseHeaders().getResponse().getHeaderMutation());
+                    trailersOnly.get() ? savedTrailers : savedResponseHeaders,
+                    response.getResponseHeaders().getResponse().getHeaderMutation());
               }
-              proceedWithSendHeaders();
+              if (trailersOnly.get()) {
+                proceedWithClose();
+              } else {
+                proceedWithSendHeaders();
+              }
             }
             else if (response.hasResponseBody()) {
               if (validateCompressionSupport(response.getResponseBody())) {
@@ -839,6 +845,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     @Override
     public void sendHeaders(Metadata headers) {
+
       serverHeadersStartNanos = System.nanoTime();
       responseHeadersSent.set(true);
       boolean sendResponseHeaders =
@@ -855,6 +862,9 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
           return;
         }
         this.savedResponseHeaders = headers;
+        if (isExtProcStreamDraining()) {
+          return;
+        }
       }
 
       sendToExtProc(ProcessingRequest.newBuilder()
@@ -980,6 +990,10 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
         }
       }
 
+      if (!responseHeadersSent.get()) {
+        trailersOnly.set(true);
+      }
+
       triggerCloseHandshake();
 
       if (config.getObservabilityMode()) {
@@ -1009,6 +1023,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     private void proceedWithClose(Status status, Metadata trailers) {
       if (dataPlaneCallClosed.compareAndSet(false, true)) {
+
         if (serverTrailersStartNanos > 0) {
           long durationNanos = System.nanoTime() - serverTrailersStartNanos;
           recordDuration(serverTrailersDuration, durationNanos);
@@ -1019,14 +1034,37 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     }
 
     private void triggerCloseHandshake() {
+      if (isExtProcStreamDraining()) {
+        return;
+      }
       if (isExtProcStreamCompleted() || !terminationTriggered.compareAndSet(false, true)) {
         return;
       }
 
+      boolean sendResponseHeaders =
+          currentProcessingMode.getResponseHeaderMode() == ProcessingMode.HeaderSendMode.SEND
+          || currentProcessingMode.getResponseHeaderMode()
+              == ProcessingMode.HeaderSendMode.DEFAULT;
+
+
       boolean sendResponseTrailers =
           currentProcessingMode.getResponseTrailerMode() == ProcessingMode.HeaderSendMode.SEND;
 
-      if (sendResponseTrailers) {
+      if (trailersOnly.get()) {
+        if (sendResponseHeaders) {
+          sendToExtProc(ProcessingRequest.newBuilder()
+              .setResponseHeaders(HttpHeaders.newBuilder()
+                  .setHeaders(toHeaderMap(savedTrailers, config.getForwardRulesConfig()))
+                  .setEndOfStream(true)
+                  .build())
+              .build());
+        } else {
+          proceedWithClose();
+          if (!config.getObservabilityMode()) {
+            closeExtProcStream();
+          }
+        }
+      } else if (sendResponseTrailers) {
         isProcessingTrailers.set(true);
         sendToExtProc(ProcessingRequest.newBuilder()
             .setResponseTrailers(HttpTrailers.newBuilder()
@@ -1129,8 +1167,27 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       closeExtProcStream();
     }
 
+    /**
+     * Evaluates whether the external processor stream can be safely closed and the
+     * data plane call terminated.
+     *
+     * <p>This method acts as a cleanup checkpoint. It is invoked when request-side
+     * processing completes (e.g., half-close) or when call termination is triggered.
+     *
+     * <p>The stream is only closed if:
+     * <ul>
+     *   <li>Call termination has been initiated ({@code terminationTriggered} is true).</li>
+     *   <li>The request side of the call is fully completed ({@code isRequestSideCompleted} is true).</li>
+     *   <li>There are no outstanding response-side messages (such as mutated response headers
+     *       or trailers) expected from the external processor.</li>
+     * </ul>
+     *
+     * <p>If all conditions are met, the data plane call is unblocked to allow the close status
+     * and trailers to be propagated, and the external processor gRPC stream is terminated.
+     */
     private void checkEndOfStream() {
       if (terminationTriggered.get() && isRequestSideCompleted()
+          && !expectedResponses.contains(EventType.RESPONSE_HEADERS)
           && !expectedResponses.contains(EventType.RESPONSE_TRAILERS)) {
         unblockAfterStreamComplete();
         closeExtProcStream();

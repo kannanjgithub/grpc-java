@@ -3392,14 +3392,15 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 9: Trailers-Only Response
+  // Category 9: Response Trailers
   // ============================================================================
 
   @Test
-  public void serverInterceptor_trailersOnly_whenResponseReceived_thenResponseTrailersSentWithEos()
+  public void givenResponseTrailerModeSend_whenCallCloses_thenResponseTrailersAndStatusPropagatedToClient()
       throws Exception {
     ExternalProcessor proto = createBaseProto(extProcServerName)
         .setProcessingMode(ProcessingMode.newBuilder()
+            .setResponseHeaderMode(ProcessingMode.HeaderSendMode.SKIP)
             .setResponseTrailerMode(ProcessingMode.HeaderSendMode.SEND)
             .build())
         .build();
@@ -3434,6 +3435,395 @@ public class ExternalProcessorServerInterceptorTest {
                                   .setHeader(io.envoyproxy.envoy.config.core.v3.HeaderValue.newBuilder()
                                       .setKey("x-mutated-trailer")
                                       .setValue("mutated-trailer-value")
+                                      .build())
+                                  .build())
+                              .build())
+                          .build())
+                      .build());
+                  responseObserver.onCompleted();
+                  extProcLatch.countDown();
+                }
+              }
+
+              @Override public void onError(Throwable t) {}
+              @Override public void onCompleted() {}
+            };
+          }
+        };
+
+    grpcCleanup.register(InProcessServerBuilder.forName(extProcServerName)
+        .addService(extProcImpl)
+        .directExecutor()
+        .build().start());
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(extProcServerName)
+              .directExecutor()
+              .build());
+    });
+
+    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
+        filterConfig, channelManager, FAKE_CONTEXT);
+
+    dataPlaneHandler = new DataPlaneServiceHandler() {
+      @Override
+      public void sayHello(InputStream request, StreamObserver<InputStream> responseObserver) {
+        responseObserver.onNext(request);
+        responseObserver.onCompleted();
+      }
+    };
+
+    startDataPlane(interceptor);
+
+    io.grpc.ClientCall<InputStream, InputStream> clientCall = dataPlaneChannel.newCall(
+        METHOD_SAY_HELLO_RAW, io.grpc.CallOptions.DEFAULT);
+
+    final AtomicReference<Metadata> receivedTrailers = new AtomicReference<>();
+    final CountDownLatch callCompletedLatch = new CountDownLatch(1);
+    clientCall.start(new io.grpc.ClientCall.Listener<InputStream>() {
+      @Override
+      public void onClose(Status status, Metadata trailers) {
+        receivedTrailers.set(trailers);
+        callCompletedLatch.countDown();
+      }
+    }, new Metadata());
+
+    clientCall.request(1);
+    clientCall.sendMessage(new ByteArrayInputStream("hello".getBytes(StandardCharsets.UTF_8)));
+    clientCall.halfClose();
+
+    assertThat(extProcLatch.await(5, TimeUnit.SECONDS)).isTrue();
+    assertThat(callCompletedLatch.await(5, TimeUnit.SECONDS)).isTrue();
+    assertThat(receivedTrailers.get()).isNotNull();
+    assertThat(receivedTrailers.get().get(Metadata.Key.of("x-mutated-trailer", Metadata.ASCII_STRING_MARSHALLER)))
+        .isEqualTo("mutated-trailer-value");
+  }
+
+  @Test
+  public void givenResponseTrailerModeSend_whenCallCloses_thenResponseTrailersSentToExtProc()
+      throws Exception {
+    ExternalProcessor proto = createBaseProto(extProcServerName)
+        .setProcessingMode(ProcessingMode.newBuilder()
+            .setResponseHeaderMode(ProcessingMode.HeaderSendMode.SKIP)
+            .setResponseTrailerMode(ProcessingMode.HeaderSendMode.SEND)
+            .build())
+        .build();
+    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
+        provider.parseFilterConfig(Any.pack(proto), filterContext);
+    assertThat(configOrError.errorDetail).isNull();
+    ExternalProcessorFilterConfig filterConfig = configOrError.config;
+
+    final CountDownLatch extProcLatch = new CountDownLatch(2); // 1 for request headers, 1 for response trailers
+    final AtomicReference<ProcessingRequest> capturedTrailerRequest = new AtomicReference<>();
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          @SuppressWarnings("unchecked")
+          public StreamObserver<ProcessingRequest> process(
+              StreamObserver<ProcessingResponse> responseObserver) {
+            ((ServerCallStreamObserver<ProcessingResponse>) responseObserver).request(100);
+            return new StreamObserver<ProcessingRequest>() {
+              @Override
+              public void onNext(ProcessingRequest request) {
+                if (request.hasRequestHeaders()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setRequestHeaders(HeadersResponse.newBuilder().build())
+                      .build());
+                  extProcLatch.countDown();
+                } else if (request.hasResponseTrailers()) {
+                  capturedTrailerRequest.set(request);
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setResponseTrailers(TrailersResponse.newBuilder().build())
+                      .build());
+                  responseObserver.onCompleted();
+                  extProcLatch.countDown();
+                }
+              }
+
+              @Override public void onError(Throwable t) {}
+              @Override public void onCompleted() {}
+            };
+          }
+        };
+
+    grpcCleanup.register(InProcessServerBuilder.forName(extProcServerName)
+        .addService(extProcImpl)
+        .directExecutor()
+        .build().start());
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(extProcServerName)
+              .directExecutor()
+              .build());
+    });
+
+    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
+        filterConfig, channelManager, FAKE_CONTEXT);
+
+    dataPlaneHandler = new DataPlaneServiceHandler() {
+      @Override
+      public void sayHello(InputStream request, StreamObserver<InputStream> responseObserver) {
+        responseObserver.onNext(request);
+        responseObserver.onCompleted();
+      }
+    };
+
+    startDataPlane(interceptor);
+
+    io.grpc.ClientCall<InputStream, InputStream> clientCall = dataPlaneChannel.newCall(
+        METHOD_SAY_HELLO_RAW, io.grpc.CallOptions.DEFAULT);
+
+    final CountDownLatch callCompletedLatch = new CountDownLatch(1);
+    clientCall.start(new io.grpc.ClientCall.Listener<InputStream>() {
+      @Override
+      public void onClose(Status status, Metadata trailers) {
+        callCompletedLatch.countDown();
+      }
+    }, new Metadata());
+
+    clientCall.request(1);
+    clientCall.sendMessage(new ByteArrayInputStream("hello".getBytes(StandardCharsets.UTF_8)));
+    clientCall.halfClose();
+
+    assertThat(extProcLatch.await(5, TimeUnit.SECONDS)).isTrue();
+    assertThat(callCompletedLatch.await(5, TimeUnit.SECONDS)).isTrue();
+    
+    ProcessingRequest req = capturedTrailerRequest.get();
+    assertThat(req).isNotNull();
+    assertThat(req.hasResponseTrailers()).isTrue();
+  }
+
+  @Test
+  public void givenResponseTrailerModeDefault_whenCallCloses_thenResponseTrailersNotSentToExtProc()
+      throws Exception {
+    ExternalProcessor proto = createBaseProto(extProcServerName)
+        .setProcessingMode(ProcessingMode.newBuilder()
+            .setResponseTrailerMode(ProcessingMode.HeaderSendMode.DEFAULT)
+            .build())
+        .build();
+    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
+        provider.parseFilterConfig(Any.pack(proto), filterContext);
+    assertThat(configOrError.errorDetail).isNull();
+    ExternalProcessorFilterConfig filterConfig = configOrError.config;
+
+    final CountDownLatch extProcLatch = new CountDownLatch(2); // 1 for request headers, 1 for response headers
+    final AtomicBoolean responseTrailersReceived = new AtomicBoolean(false);
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          @SuppressWarnings("unchecked")
+          public StreamObserver<ProcessingRequest> process(
+              StreamObserver<ProcessingResponse> responseObserver) {
+            ((ServerCallStreamObserver<ProcessingResponse>) responseObserver).request(100);
+            return new StreamObserver<ProcessingRequest>() {
+              @Override
+              public void onNext(ProcessingRequest request) {
+                if (request.hasRequestHeaders()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setRequestHeaders(HeadersResponse.newBuilder().build())
+                      .build());
+                  extProcLatch.countDown();
+                } else if (request.hasResponseHeaders()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setResponseHeaders(HeadersResponse.newBuilder().build())
+                      .build());
+                  responseObserver.onCompleted();
+                  extProcLatch.countDown();
+                } else if (request.hasResponseTrailers()) {
+                  responseTrailersReceived.set(true);
+                }
+              }
+
+              @Override public void onError(Throwable t) {}
+              @Override public void onCompleted() {}
+            };
+          }
+        };
+
+    grpcCleanup.register(InProcessServerBuilder.forName(extProcServerName)
+        .addService(extProcImpl)
+        .directExecutor()
+        .build().start());
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(extProcServerName)
+              .directExecutor()
+              .build());
+    });
+
+    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
+        filterConfig, channelManager, FAKE_CONTEXT);
+
+    dataPlaneHandler = new DataPlaneServiceHandler() {
+      @Override
+      public void sayHello(InputStream request, StreamObserver<InputStream> responseObserver) {
+        responseObserver.onNext(request);
+        responseObserver.onCompleted();
+      }
+    };
+
+    startDataPlane(interceptor);
+
+    io.grpc.ClientCall<InputStream, InputStream> clientCall = dataPlaneChannel.newCall(
+        METHOD_SAY_HELLO_RAW, io.grpc.CallOptions.DEFAULT);
+
+    final CountDownLatch callCompletedLatch = new CountDownLatch(1);
+    clientCall.start(new io.grpc.ClientCall.Listener<InputStream>() {
+      @Override
+      public void onClose(Status status, Metadata trailers) {
+        callCompletedLatch.countDown();
+      }
+    }, new Metadata());
+
+    clientCall.request(1);
+    clientCall.sendMessage(new ByteArrayInputStream("hello".getBytes(StandardCharsets.UTF_8)));
+    clientCall.halfClose();
+
+    assertThat(extProcLatch.await(5, TimeUnit.SECONDS)).isTrue();
+    assertThat(callCompletedLatch.await(5, TimeUnit.SECONDS)).isTrue();
+    assertThat(responseTrailersReceived.get()).isFalse();
+  }
+
+  @Test
+  public void givenResponseTrailerModeSkip_whenCallCloses_thenResponseTrailersNotSentToExtProc()
+      throws Exception {
+    ExternalProcessor proto = createBaseProto(extProcServerName)
+        .setProcessingMode(ProcessingMode.newBuilder()
+            .setResponseTrailerMode(ProcessingMode.HeaderSendMode.SKIP)
+            .build())
+        .build();
+    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
+        provider.parseFilterConfig(Any.pack(proto), filterContext);
+    assertThat(configOrError.errorDetail).isNull();
+    ExternalProcessorFilterConfig filterConfig = configOrError.config;
+
+    final CountDownLatch extProcLatch = new CountDownLatch(2); // 1 for request headers, 1 for response headers
+    final AtomicBoolean responseTrailersReceived = new AtomicBoolean(false);
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          @SuppressWarnings("unchecked")
+          public StreamObserver<ProcessingRequest> process(
+              StreamObserver<ProcessingResponse> responseObserver) {
+            ((ServerCallStreamObserver<ProcessingResponse>) responseObserver).request(100);
+            return new StreamObserver<ProcessingRequest>() {
+              @Override
+              public void onNext(ProcessingRequest request) {
+                if (request.hasRequestHeaders()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setRequestHeaders(HeadersResponse.newBuilder().build())
+                      .build());
+                  extProcLatch.countDown();
+                } else if (request.hasResponseHeaders()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setResponseHeaders(HeadersResponse.newBuilder().build())
+                      .build());
+                  responseObserver.onCompleted();
+                  extProcLatch.countDown();
+                } else if (request.hasResponseTrailers()) {
+                  responseTrailersReceived.set(true);
+                }
+              }
+
+              @Override public void onError(Throwable t) {}
+              @Override public void onCompleted() {}
+            };
+          }
+        };
+
+    grpcCleanup.register(InProcessServerBuilder.forName(extProcServerName)
+        .addService(extProcImpl)
+        .directExecutor()
+        .build().start());
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(extProcServerName)
+              .directExecutor()
+              .build());
+    });
+
+    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
+        filterConfig, channelManager, FAKE_CONTEXT);
+
+    dataPlaneHandler = new DataPlaneServiceHandler() {
+      @Override
+      public void sayHello(InputStream request, StreamObserver<InputStream> responseObserver) {
+        responseObserver.onNext(request);
+        responseObserver.onCompleted();
+      }
+    };
+
+    startDataPlane(interceptor);
+
+    io.grpc.ClientCall<InputStream, InputStream> clientCall = dataPlaneChannel.newCall(
+        METHOD_SAY_HELLO_RAW, io.grpc.CallOptions.DEFAULT);
+
+    final CountDownLatch callCompletedLatch = new CountDownLatch(1);
+    clientCall.start(new io.grpc.ClientCall.Listener<InputStream>() {
+      @Override
+      public void onClose(Status status, Metadata trailers) {
+        callCompletedLatch.countDown();
+      }
+    }, new Metadata());
+
+    clientCall.request(1);
+    clientCall.sendMessage(new ByteArrayInputStream("hello".getBytes(StandardCharsets.UTF_8)));
+    clientCall.halfClose();
+
+    assertThat(extProcLatch.await(5, TimeUnit.SECONDS)).isTrue();
+    assertThat(callCompletedLatch.await(5, TimeUnit.SECONDS)).isTrue();
+    assertThat(responseTrailersReceived.get()).isFalse();
+  }
+
+  // ============================================================================
+  // Category 10: Trailers-Only Response Handling
+  // ============================================================================
+
+  @Test
+  public void givenResponseHeaderModeSend_whenTrailersOnlySent_thenResponseHeadersSentToExtProc()
+      throws Exception {
+    ExternalProcessor proto = createBaseProto(extProcServerName)
+        .setProcessingMode(ProcessingMode.newBuilder()
+            .setResponseHeaderMode(ProcessingMode.HeaderSendMode.SEND)
+            .build())
+        .build();
+    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
+        provider.parseFilterConfig(Any.pack(proto), filterContext);
+    assertThat(configOrError.errorDetail).isNull();
+    ExternalProcessorFilterConfig filterConfig = configOrError.config;
+
+    final CountDownLatch extProcLatch = new CountDownLatch(2); // 1 for request headers, 1 for response headers
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          @SuppressWarnings("unchecked")
+          public StreamObserver<ProcessingRequest> process(
+              StreamObserver<ProcessingResponse> responseObserver) {
+            ((ServerCallStreamObserver<ProcessingResponse>) responseObserver).request(100);
+            return new StreamObserver<ProcessingRequest>() {
+              @Override
+              public void onNext(ProcessingRequest request) {
+                if (request.hasRequestHeaders()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setRequestHeaders(HeadersResponse.newBuilder()
+                          .setResponse(CommonResponse.newBuilder().build())
+                          .build())
+                      .build());
+                  extProcLatch.countDown();
+                } else if (request.hasResponseHeaders()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setResponseHeaders(HeadersResponse.newBuilder()
+                          .setResponse(CommonResponse.newBuilder()
+                              .setHeaderMutation(HeaderMutation.newBuilder()
+                                  .addSetHeaders(io.envoyproxy.envoy.config.core.v3.HeaderValueOption.newBuilder()
+                                      .setHeader(io.envoyproxy.envoy.config.core.v3.HeaderValue.newBuilder()
+                                          .setKey("x-mutated-trailer")
+                                          .setValue("mutated-trailer-value")
+                                          .build())
                                       .build())
                                   .build())
                               .build())
@@ -3505,11 +3895,11 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   @Test
-  public void serverInterceptor_trailersOnly_whenResponseTrailerModeSkip_thenResponseTrailersNotSentToExtProc()
+  public void givenResponseHeaderModeDefault_whenTrailersOnlySent_thenResponseHeadersSentToExtProc()
       throws Exception {
     ExternalProcessor proto = createBaseProto(extProcServerName)
         .setProcessingMode(ProcessingMode.newBuilder()
-            .setResponseTrailerMode(ProcessingMode.HeaderSendMode.SKIP)
+            .setResponseHeaderMode(ProcessingMode.HeaderSendMode.DEFAULT)
             .build())
         .build();
     ConfigOrError<ExternalProcessorFilterConfig> configOrError =
@@ -3517,8 +3907,7 @@ public class ExternalProcessorServerInterceptorTest {
     assertThat(configOrError.errorDetail).isNull();
     ExternalProcessorFilterConfig filterConfig = configOrError.config;
 
-    final CountDownLatch extProcLatch = new CountDownLatch(1); // 1 for request headers, response trailers skipped
-    final AtomicBoolean responseTrailersReceived = new AtomicBoolean(false);
+    final CountDownLatch extProcLatch = new CountDownLatch(2); // 1 for request headers, 1 for response headers
     ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
         new ExternalProcessorGrpc.ExternalProcessorImplBase() {
           @Override
@@ -3536,10 +3925,120 @@ public class ExternalProcessorServerInterceptorTest {
                           .build())
                       .build());
                   extProcLatch.countDown();
-                } else if (request.hasResponseTrailers()) {
-                  responseTrailersReceived.set(true);
+                } else if (request.hasResponseHeaders()) {
                   responseObserver.onNext(ProcessingResponse.newBuilder()
-                      .setResponseTrailers(TrailersResponse.newBuilder().build())
+                      .setResponseHeaders(HeadersResponse.newBuilder()
+                          .setResponse(CommonResponse.newBuilder()
+                              .setHeaderMutation(HeaderMutation.newBuilder()
+                                  .addSetHeaders(io.envoyproxy.envoy.config.core.v3.HeaderValueOption.newBuilder()
+                                      .setHeader(io.envoyproxy.envoy.config.core.v3.HeaderValue.newBuilder()
+                                          .setKey("x-mutated-trailer")
+                                          .setValue("mutated-trailer-value")
+                                          .build())
+                                      .build())
+                                  .build())
+                              .build())
+                          .build())
+                      .build());
+                  responseObserver.onCompleted();
+                  extProcLatch.countDown();
+                }
+              }
+
+              @Override public void onError(Throwable t) {}
+              @Override public void onCompleted() {}
+            };
+          }
+        };
+
+    grpcCleanup.register(InProcessServerBuilder.forName(extProcServerName)
+        .addService(extProcImpl)
+        .directExecutor()
+        .build().start());
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(extProcServerName)
+              .directExecutor()
+              .build());
+    });
+
+    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
+        filterConfig, channelManager, FAKE_CONTEXT);
+
+    dataPlaneHandler = new DataPlaneServiceHandler() {
+      @Override
+      public void sayHello(InputStream request, StreamObserver<InputStream> responseObserver) {
+        // Directly close with error without calling onNext / sendHeaders
+        responseObserver.onError(
+            Status.UNAUTHENTICATED.withDescription("forced-trailers-only").asRuntimeException());
+      }
+    };
+
+    startDataPlane(interceptor);
+
+    io.grpc.ClientCall<InputStream, InputStream> clientCall = dataPlaneChannel.newCall(
+        METHOD_SAY_HELLO_RAW, io.grpc.CallOptions.DEFAULT);
+
+    final AtomicReference<Metadata> receivedTrailers = new AtomicReference<>();
+    final CountDownLatch callCompletedLatch = new CountDownLatch(1);
+    final AtomicReference<Status> receivedStatus = new AtomicReference<>();
+
+    clientCall.start(new io.grpc.ClientCall.Listener<InputStream>() {
+      @Override
+      public void onClose(Status status, Metadata trailers) {
+        receivedStatus.set(status);
+        receivedTrailers.set(trailers);
+        callCompletedLatch.countDown();
+      }
+    }, new Metadata());
+
+    clientCall.request(1);
+    clientCall.sendMessage(new ByteArrayInputStream("hello".getBytes(StandardCharsets.UTF_8)));
+    clientCall.halfClose();
+
+    assertThat(extProcLatch.await(5, TimeUnit.SECONDS)).isTrue();
+    assertThat(callCompletedLatch.await(5, TimeUnit.SECONDS)).isTrue();
+    assertThat(receivedStatus.get().getCode()).isEqualTo(Status.Code.UNAUTHENTICATED);
+    assertThat(receivedTrailers.get()).isNotNull();
+    assertThat(receivedTrailers.get().get(Metadata.Key.of("x-mutated-trailer", Metadata.ASCII_STRING_MARSHALLER)))
+        .isEqualTo("mutated-trailer-value");
+  }
+
+  @Test
+  public void givenResponseHeaderModeSkip_whenTrailersOnlySent_thenResponseHeadersNotSentToExtProc()
+      throws Exception {
+    ExternalProcessor proto = createBaseProto(extProcServerName)
+        .setProcessingMode(ProcessingMode.newBuilder()
+            .setResponseHeaderMode(ProcessingMode.HeaderSendMode.SKIP)
+            .build())
+        .build();
+    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
+        provider.parseFilterConfig(Any.pack(proto), filterContext);
+    assertThat(configOrError.errorDetail).isNull();
+    ExternalProcessorFilterConfig filterConfig = configOrError.config;
+
+    final CountDownLatch extProcLatch = new CountDownLatch(1); // 1 for request headers, response headers/trailers skipped
+    final AtomicBoolean responseHeadersReceived = new AtomicBoolean(false);
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          @SuppressWarnings("unchecked")
+          public StreamObserver<ProcessingRequest> process(
+              StreamObserver<ProcessingResponse> responseObserver) {
+            ((ServerCallStreamObserver<ProcessingResponse>) responseObserver).request(100);
+            return new StreamObserver<ProcessingRequest>() {
+              @Override
+              public void onNext(ProcessingRequest request) {
+                if (request.hasRequestHeaders()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setRequestHeaders(HeadersResponse.newBuilder().build())
+                      .build());
+                  extProcLatch.countDown();
+                } else if (request.hasResponseHeaders()) {
+                  responseHeadersReceived.set(true);
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setResponseHeaders(HeadersResponse.newBuilder().build())
                       .build());
                   responseObserver.onCompleted();
                   extProcLatch.countDown();
@@ -3605,7 +4104,7 @@ public class ExternalProcessorServerInterceptorTest {
 
     assertThat(extProcLatch.await(5, TimeUnit.SECONDS)).isTrue();
     assertThat(callCompletedLatch.await(5, TimeUnit.SECONDS)).isTrue();
-    assertThat(responseTrailersReceived.get()).isFalse();
+    assertThat(responseHeadersReceived.get()).isFalse();
     assertThat(receivedStatus.get().getCode()).isEqualTo(Status.Code.UNAUTHENTICATED);
     assertThat(receivedStatus.get().getDescription()).isEqualTo("forced-trailers-only");
     assertThat(receivedTrailers.get()).isNotNull();
@@ -3614,8 +4113,10 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
 
+
+
   // ============================================================================
-  // Category 10: Half-Close handling
+  // Category 11: Half-Close handling
   // ============================================================================
 
   @Test
@@ -4298,7 +4799,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 11: Outbound Backpressure (isReady / onReady)
+  // Category 12: Outbound Backpressure (isReady / onReady)
   // ============================================================================
 
   @Test
@@ -4726,7 +5227,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 12: Ext-proc request draining
+  // Category 13: Ext-proc request draining
   // ============================================================================
 
   @Test
@@ -5082,7 +5583,7 @@ public class ExternalProcessorServerInterceptorTest {
 
   @Test
   @SuppressWarnings("unchecked")
-  public void givenDrainingStream_whenAppSends_thenBufferedAndDelivered()
+  public void drainingStartsBeforeResponseHeaders_whenAppSendsMessagesAndStatus_thenBufferedAndDelivered()
       throws Exception {
     String uniqueExtProcServerName = InProcessServerBuilder.generateName();
     ExternalProcessor proto = ExternalProcessor.newBuilder()
@@ -5161,13 +5662,26 @@ public class ExternalProcessorServerInterceptorTest {
         filterConfig, channelManager, FAKE_CONTEXT);
 
     final AtomicReference<ServerCall<InputStream, InputStream>> interceptedCallRef = new AtomicReference<>();
+    final List<Metadata> rawSentHeaders = new java.util.concurrent.CopyOnWriteArrayList<>();
     final List<InputStream> rawSentMessages = new java.util.concurrent.CopyOnWriteArrayList<>();
-    final CountDownLatch rawSentLatch = new CountDownLatch(1);
+    final AtomicReference<Status> rawSentStatus = new AtomicReference<>();
+    final AtomicReference<Metadata> rawSentTrailers = new AtomicReference<>();
+    final CountDownLatch rawCloseLatch = new CountDownLatch(1);
+
     ServerCall<InputStream, InputStream> rawCall = new SimpleServerCall(METHOD_SAY_HELLO_RAW) {
+      @Override
+      public void sendHeaders(Metadata headers) {
+        rawSentHeaders.add(headers);
+      }
       @Override
       public void sendMessage(InputStream message) {
         rawSentMessages.add(message);
-        rawSentLatch.countDown();
+      }
+      @Override
+      public void close(Status status, Metadata trailers) {
+        rawSentStatus.set(status);
+        rawSentTrailers.set(trailers);
+        rawCloseLatch.countDown();
       }
       @Override
       public boolean isReady() {
@@ -5185,28 +5699,43 @@ public class ExternalProcessorServerInterceptorTest {
       assertThat(drainCompletedLatch.await(5, TimeUnit.SECONDS)).isTrue();
       assertThat(interceptedCallRef.get().isReady()).isFalse();
 
-      // Send response message during drain state
-      interceptedCallRef.get().sendMessage(new ByteArrayInputStream("response message during drain".getBytes(StandardCharsets.UTF_8)));
+      // App sends response headers, message and closes server-side concurrently during drain
+      final CountDownLatch appActionLatch = new CountDownLatch(1);
+      new Thread(() -> {
+        ServerCall<InputStream, InputStream> interceptedCall = interceptedCallRef.get();
+        interceptedCall.sendHeaders(new Metadata());
+        interceptedCall.sendMessage(
+            new ByteArrayInputStream("response message during drain".getBytes(StandardCharsets.UTF_8)));
+        interceptedCall.close(Status.OK, new Metadata());
+        appActionLatch.countDown();
+      }).start();
+
+      assertThat(appActionLatch.await(5, TimeUnit.SECONDS)).isTrue();
 
       // Assert that it was NOT received by extProc
       assertThat(extProcReceivedBodyCount.get()).isEqualTo(0);
-      // Assert that it was NOT sent to the client rawCall
+      // Assert that nothing has been delivered to client (rawCall) yet because drain is active
+      assertThat(rawSentHeaders).isEmpty();
       assertThat(rawSentMessages).isEmpty();
+      assertThat(rawSentStatus.get()).isNull();
 
-      // Now let sidecar complete
+      // Now let sidecar complete the drain
       sidecarFinishLatch.countDown();
 
-      // Wait for it to become ready again
-      long startTime = System.currentTimeMillis();
-      while (!interceptedCallRef.get().isReady() && System.currentTimeMillis() - startTime < 5000) {
-        Thread.sleep(10);
-      }
-      assertThat(interceptedCallRef.get().isReady()).isTrue();
+      // Wait for rawCall to close
+      assertThat(rawCloseLatch.await(5, TimeUnit.SECONDS)).isTrue();
 
-      // Assert that the message sent during drain is received by the client (raw call)
-      assertThat(rawSentLatch.await(5, TimeUnit.SECONDS)).isTrue();
-      assertThat(new String(ByteStreams.toByteArray(rawSentMessages.get(0)), StandardCharsets.UTF_8))
-          .isEqualTo("response message during drain");
+      // Verify delivery order: headers first, then app response message during drain, then close
+      assertThat(rawSentHeaders).hasSize(1);
+      
+      List<String> deliveredMessages = new ArrayList<>();
+      for (InputStream is : rawSentMessages) {
+        deliveredMessages.add(new String(ByteStreams.toByteArray(is), StandardCharsets.UTF_8));
+      }
+      assertThat(deliveredMessages).containsExactly("response message during drain").inOrder();
+
+      assertThat(rawSentStatus.get().isOk()).isTrue();
+      assertThat(rawSentTrailers.get()).isNotNull();
     } finally {
       if (responseObserverRef.get() != null) {
         try {
@@ -5219,7 +5748,228 @@ public class ExternalProcessorServerInterceptorTest {
 
   @Test
   @SuppressWarnings("unchecked")
-  public void givenDrainingStream_whenClientResponds_thenBufferedAndDelivered()
+  public void drainingStartsAfterResponseHeaders_whenAppSendsMessagesAndStatus_thenBufferedAndDelivered()
+      throws Exception {
+    String uniqueExtProcServerName = InProcessServerBuilder.generateName();
+    ExternalProcessor proto = ExternalProcessor.newBuilder()
+        .setGrpcService(GrpcService.newBuilder()
+            .setGoogleGrpc(GrpcService.GoogleGrpc.newBuilder()
+                .setTargetUri("in-process:///" + uniqueExtProcServerName)
+                .addChannelCredentialsPlugin(Any.newBuilder()
+                    .setTypeUrl("type.googleapis.com/envoy.extensions.grpc_service." 
+                        + "channel_credentials.insecure.v3.InsecureCredentials")
+                    .build())
+                .build())
+            .build())
+        .setProcessingMode(ProcessingMode.newBuilder()
+            .setRequestHeaderMode(ProcessingMode.HeaderSendMode.SKIP)
+            .setResponseHeaderMode(ProcessingMode.HeaderSendMode.SEND)
+            .setResponseBodyMode(ProcessingMode.BodySendMode.GRPC)
+            .setResponseTrailerMode(ProcessingMode.HeaderSendMode.SEND)
+            .build())
+        .build();
+    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
+        provider.parseFilterConfig(Any.pack(proto), filterContext);
+    assertThat(configOrError.errorDetail).isNull();
+    ExternalProcessorFilterConfig filterConfig = configOrError.config;
+
+    // External Processor Server
+    final CountDownLatch sidecarFinishLatch = new CountDownLatch(1);
+    final CountDownLatch drainCompletedLatch = new CountDownLatch(1);
+    final AtomicInteger extProcReceivedBodyCount = new AtomicInteger(0);
+    final AtomicReference<StreamObserver<ProcessingResponse>> responseObserverRef = new AtomicReference<>();
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          @SuppressWarnings("unchecked")
+          public StreamObserver<ProcessingRequest> process(
+              final StreamObserver<ProcessingResponse> responseObserver) {
+            responseObserverRef.set(responseObserver);
+            ((ServerCallStreamObserver<ProcessingResponse>) responseObserver).request(100);
+            return new StreamObserver<ProcessingRequest>() {
+              @Override
+              public void onNext(ProcessingRequest request) {
+                if (request.hasResponseHeaders()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setResponseHeaders(HeadersResponse.newBuilder().build())
+                      .build());
+                } else if (request.hasResponseBody()) {
+                  int bodyIdx = extProcReceivedBodyCount.incrementAndGet();
+                  if (bodyIdx == 1) {
+                    // Send mutated response body for the first original message
+                    responseObserver.onNext(ProcessingResponse.newBuilder()
+                        .setResponseBody(BodyResponse.newBuilder()
+                            .setResponse(CommonResponse.newBuilder()
+                                .setBodyMutation(BodyMutation.newBuilder()
+                                    .setStreamedResponse(StreamedBodyResponse.newBuilder()
+                                        .setBody(ByteString.copyFromUtf8("mutated-msg-1"))
+                                        .build())
+                                    .build())
+                                .build())
+                            .build())
+                        .build());
+                  } else if (bodyIdx == 2) {
+                    // Send mutated response body for second original message and trigger draining
+                    new Thread(() -> {
+                      responseObserver.onNext(ProcessingResponse.newBuilder()
+                          .setResponseBody(BodyResponse.newBuilder()
+                              .setResponse(CommonResponse.newBuilder()
+                                  .setBodyMutation(BodyMutation.newBuilder()
+                                      .setStreamedResponse(StreamedBodyResponse.newBuilder()
+                                          .setBody(ByteString.copyFromUtf8("mutated-msg-2"))
+                                          .build())
+                                      .build())
+                                  .build())
+                              .build())
+                          .setRequestDrain(true)
+                          .build());
+                      try {
+                        if (sidecarFinishLatch.await(5, TimeUnit.SECONDS)) {
+                          responseObserver.onCompleted();
+                        }
+                      } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                      }
+                    }).start();
+                  }
+                }
+              }
+
+              @Override public void onError(Throwable t) {}
+              @Override
+              public void onCompleted() {
+                drainCompletedLatch.countDown();
+              }
+            };
+          }
+        };
+    grpcCleanup.register(InProcessServerBuilder.forName(uniqueExtProcServerName)
+        .addService(extProcImpl)
+        .directExecutor()
+        .build().start());
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(uniqueExtProcServerName).directExecutor().build());
+    });
+
+    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
+        filterConfig, channelManager, FAKE_CONTEXT);
+
+    final AtomicReference<ServerCall<InputStream, InputStream>> interceptedCallRef = new AtomicReference<>();
+    final List<Metadata> rawSentHeaders = new java.util.concurrent.CopyOnWriteArrayList<>();
+    final List<InputStream> rawSentMessages = new java.util.concurrent.CopyOnWriteArrayList<>();
+    final AtomicReference<Status> rawSentStatus = new AtomicReference<>();
+    final AtomicReference<Metadata> rawSentTrailers = new AtomicReference<>();
+    final CountDownLatch rawCloseLatch = new CountDownLatch(1);
+
+    ServerCall<InputStream, InputStream> rawCall = new SimpleServerCall(METHOD_SAY_HELLO_RAW) {
+      @Override
+      public void sendHeaders(Metadata headers) {
+        rawSentHeaders.add(headers);
+      }
+      @Override
+      public void sendMessage(InputStream message) {
+        rawSentMessages.add(message);
+      }
+      @Override
+      public void close(Status status, Metadata trailers) {
+        rawSentStatus.set(status);
+        rawSentTrailers.set(trailers);
+        rawCloseLatch.countDown();
+      }
+      @Override
+      public boolean isReady() {
+        return true;
+      }
+    };
+
+    try {
+      interceptor.interceptCall(rawCall, new Metadata(), (call, headers) -> {
+        interceptedCallRef.set(call);
+        return new ServerCall.Listener<InputStream>() {};
+      });
+
+      ServerCall<InputStream, InputStream> interceptedCall = interceptedCallRef.get();
+
+      // App sends response headers
+      interceptedCall.sendHeaders(new Metadata());
+      // Wait for headers to be received by client
+      long startTime = System.currentTimeMillis();
+      while (rawSentHeaders.isEmpty() && System.currentTimeMillis() - startTime < 5000) {
+        Thread.sleep(10);
+      }
+      assertThat(rawSentHeaders).hasSize(1);
+
+      // App sends 1st message
+      interceptedCall.sendMessage(
+          new ByteArrayInputStream("original-msg-1".getBytes(StandardCharsets.UTF_8)));
+      // Wait for 1st mutated message to be received by client
+      startTime = System.currentTimeMillis();
+      while (rawSentMessages.isEmpty() && System.currentTimeMillis() - startTime < 5000) {
+        Thread.sleep(10);
+      }
+      assertThat(rawSentMessages).hasSize(1);
+
+      // App sends 2nd message
+      interceptedCall.sendMessage(
+          new ByteArrayInputStream("original-msg-2".getBytes(StandardCharsets.UTF_8)));
+
+      // Wait for 2nd mutated message to be received by client, and wait for drain to be active
+      startTime = System.currentTimeMillis();
+      while ((rawSentMessages.size() < 2 || interceptedCall.isReady())
+          && System.currentTimeMillis() - startTime < 5000) {
+        Thread.sleep(10);
+      }
+      assertThat(rawSentMessages).hasSize(2);
+      assertThat(interceptedCall.isReady()).isFalse();
+
+      // Now that draining is active, App sends message and closes the server side of the call concurrently
+      final CountDownLatch appActionLatch = new CountDownLatch(1);
+      new Thread(() -> {
+        interceptedCall.sendMessage(
+            new ByteArrayInputStream("unmutated-msg-during-drain".getBytes(StandardCharsets.UTF_8)));
+        interceptedCall.close(Status.OK, new Metadata());
+        appActionLatch.countDown();
+      }).start();
+
+      assertThat(appActionLatch.await(5, TimeUnit.SECONDS)).isTrue();
+
+      // Assert that nothing has been delivered to client (rawCall) during active drain
+      assertThat(rawSentMessages).hasSize(2); // Still only 2 mutated messages
+      assertThat(rawSentStatus.get()).isNull();
+
+      // Now let sidecar complete the drain
+      sidecarFinishLatch.countDown();
+
+      // Wait for rawCall to close
+      assertThat(rawCloseLatch.await(5, TimeUnit.SECONDS)).isTrue();
+
+      // Verify delivery order: headers, mutated-msg-1, mutated-msg-2, unmutated-msg-during-drain, and status OK
+      assertThat(rawSentHeaders).hasSize(1);
+      
+      List<String> deliveredMessages = new ArrayList<>();
+      for (InputStream is : rawSentMessages) {
+        deliveredMessages.add(new String(ByteStreams.toByteArray(is), StandardCharsets.UTF_8));
+      }
+      assertThat(deliveredMessages).containsExactly(
+          "mutated-msg-1", "mutated-msg-2", "unmutated-msg-during-drain").inOrder();
+
+      assertThat(rawSentStatus.get().isOk()).isTrue();
+      assertThat(rawSentTrailers.get()).isNotNull();
+    } finally {
+      if (responseObserverRef.get() != null) {
+        try {
+          responseObserverRef.get().onCompleted();
+        } catch (IllegalStateException ignored) {}
+      }
+      channelManager.close();
+    }
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
+  public void drainingStartsBeforeRequestHeaders_whenClientSendsMessages_thenBufferedAndDelivered()
       throws Exception {
     String uniqueExtProcServerName = InProcessServerBuilder.generateName();
     ExternalProcessor proto = ExternalProcessor.newBuilder()
@@ -5355,8 +6105,213 @@ public class ExternalProcessorServerInterceptorTest {
     }
   }
 
+  @Test
+  @SuppressWarnings("unchecked")
+  public void drainingStartsAfterRequestHeaders_whenClientSendsMessages_thenBufferedAndDelivered()
+      throws Exception {
+    String uniqueExtProcServerName = InProcessServerBuilder.generateName();
+    ExternalProcessor proto = ExternalProcessor.newBuilder()
+        .setGrpcService(GrpcService.newBuilder()
+            .setGoogleGrpc(GrpcService.GoogleGrpc.newBuilder()
+                .setTargetUri("in-process:///" + uniqueExtProcServerName)
+                .addChannelCredentialsPlugin(Any.newBuilder()
+                    .setTypeUrl("type.googleapis.com/envoy.extensions.grpc_service." 
+                        + "channel_credentials.insecure.v3.InsecureCredentials")
+                    .build())
+                .build())
+            .build())
+        .setProcessingMode(ProcessingMode.newBuilder()
+            .setRequestHeaderMode(ProcessingMode.HeaderSendMode.SEND)
+            .setRequestBodyMode(ProcessingMode.BodySendMode.GRPC)
+            .setResponseHeaderMode(ProcessingMode.HeaderSendMode.SKIP)
+            .setResponseBodyMode(ProcessingMode.BodySendMode.NONE)
+            .build())
+        .build();
+    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
+        provider.parseFilterConfig(Any.pack(proto), filterContext);
+    assertThat(configOrError.errorDetail).isNull();
+    ExternalProcessorFilterConfig filterConfig = configOrError.config;
+
+    // External Processor Server
+    final CountDownLatch sidecarFinishLatch = new CountDownLatch(1);
+    final CountDownLatch drainCompletedLatch = new CountDownLatch(1);
+    final AtomicInteger extProcReceivedBodyCount = new AtomicInteger(0);
+    final AtomicReference<StreamObserver<ProcessingResponse>> responseObserverRef = new AtomicReference<>();
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          @SuppressWarnings("unchecked")
+          public StreamObserver<ProcessingRequest> process(
+              final StreamObserver<ProcessingResponse> responseObserver) {
+            responseObserverRef.set(responseObserver);
+            ((ServerCallStreamObserver<ProcessingResponse>) responseObserver).request(100);
+            return new StreamObserver<ProcessingRequest>() {
+              @Override
+              public void onNext(ProcessingRequest request) {
+                if (request.hasRequestHeaders()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setRequestHeaders(HeadersResponse.newBuilder().build())
+                      .build());
+                } else if (request.hasRequestBody()) {
+                  int bodyIdx = extProcReceivedBodyCount.incrementAndGet();
+                  if (bodyIdx == 1) {
+                    responseObserver.onNext(ProcessingResponse.newBuilder()
+                        .setRequestBody(BodyResponse.newBuilder()
+                            .setResponse(CommonResponse.newBuilder()
+                                .setBodyMutation(BodyMutation.newBuilder()
+                                    .setStreamedResponse(StreamedBodyResponse.newBuilder()
+                                        .setBody(ByteString.copyFromUtf8("mutated-msg-1"))
+                                        .build())
+                                    .build())
+                                .build())
+                            .build())
+                        .build());
+                  } else if (bodyIdx == 2) {
+                    new Thread(() -> {
+                      responseObserver.onNext(ProcessingResponse.newBuilder()
+                          .setRequestBody(BodyResponse.newBuilder()
+                              .setResponse(CommonResponse.newBuilder()
+                                  .setBodyMutation(BodyMutation.newBuilder()
+                                      .setStreamedResponse(StreamedBodyResponse.newBuilder()
+                                          .setBody(ByteString.copyFromUtf8("mutated-msg-2"))
+                                          .build())
+                                      .build())
+                                  .build())
+                              .build())
+                          .setRequestDrain(true)
+                          .build());
+                      try {
+                        if (sidecarFinishLatch.await(5, TimeUnit.SECONDS)) {
+                          responseObserver.onCompleted();
+                        }
+                      } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                      }
+                    }).start();
+                  }
+                }
+              }
+
+              @Override public void onError(Throwable t) {}
+              @Override
+              public void onCompleted() {
+                drainCompletedLatch.countDown();
+              }
+            };
+          }
+        };
+    grpcCleanup.register(InProcessServerBuilder.forName(uniqueExtProcServerName)
+        .addService(extProcImpl)
+        .directExecutor()
+        .build().start());
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(uniqueExtProcServerName).directExecutor().build());
+    });
+
+    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
+        filterConfig, channelManager, FAKE_CONTEXT);
+
+    final List<String> serverReceivedMessages = new java.util.concurrent.CopyOnWriteArrayList<>();
+    final CountDownLatch appHalfCloseLatch = new CountDownLatch(1);
+    ServerCall.Listener<InputStream> appListener = new ServerCall.Listener<InputStream>() {
+      @Override
+      public void onMessage(InputStream message) {
+        try {
+          serverReceivedMessages.add(new String(ByteStreams.toByteArray(message), StandardCharsets.UTF_8));
+        } catch (IOException e) {
+          throw new RuntimeException(e);
+        }
+      }
+      @Override
+      public void onHalfClose() {
+        appHalfCloseLatch.countDown();
+      }
+    };
+
+    final AtomicReference<ServerCall<InputStream, InputStream>> interceptedCallRef = new AtomicReference<>();
+    ServerCall<InputStream, InputStream> rawCall = new SimpleServerCall(METHOD_SAY_HELLO_RAW) {
+      @Override
+      public boolean isReady() {
+        return true;
+      }
+    };
+
+    try {
+      ServerCall.Listener<InputStream> interceptedListener =
+          interceptor.interceptCall(rawCall, new Metadata(), (call, headers) -> {
+            interceptedCallRef.set(call);
+            return appListener;
+          });
+
+      // Wait until the call is active (headers processed and delegate listener created)
+      long startTime = System.currentTimeMillis();
+      while (interceptedCallRef.get() == null && System.currentTimeMillis() - startTime < 5000) {
+        Thread.sleep(10);
+      }
+      assertThat(interceptedCallRef.get()).isNotNull();
+
+      ServerCall<InputStream, InputStream> interceptedCall = interceptedCallRef.get();
+
+      // Client sends 1st message
+      interceptedListener.onMessage(
+          new ByteArrayInputStream("original-msg-1".getBytes(StandardCharsets.UTF_8)));
+      // Wait for 1st mutated message to be received by app
+      startTime = System.currentTimeMillis();
+      while (serverReceivedMessages.size() < 1 && System.currentTimeMillis() - startTime < 5000) {
+        Thread.sleep(10);
+      }
+      assertThat(serverReceivedMessages).containsExactly("mutated-msg-1");
+
+      // Client sends 2nd message
+      interceptedListener.onMessage(
+          new ByteArrayInputStream("original-msg-2".getBytes(StandardCharsets.UTF_8)));
+      // Wait for 2nd mutated message to be received by app, and wait for drain to be active
+      startTime = System.currentTimeMillis();
+      while ((serverReceivedMessages.size() < 2 || interceptedCall.isReady())
+          && System.currentTimeMillis() - startTime < 5000) {
+        Thread.sleep(10);
+      }
+      assertThat(serverReceivedMessages).containsExactly("mutated-msg-1", "mutated-msg-2").inOrder();
+      assertThat(interceptedCall.isReady()).isFalse();
+
+      // Client concurrently sends message and half-closes during active drain
+      final CountDownLatch clientActionLatch = new CountDownLatch(1);
+      new Thread(() -> {
+        interceptedListener.onMessage(
+            new ByteArrayInputStream("client-msg-during-drain".getBytes(StandardCharsets.UTF_8)));
+        interceptedListener.onHalfClose();
+        clientActionLatch.countDown();
+      }).start();
+
+      assertThat(clientActionLatch.await(5, TimeUnit.SECONDS)).isTrue();
+
+      // Assert that nothing has been delivered to the app during active drain
+      assertThat(serverReceivedMessages).hasSize(2); // Still only 2 mutated messages
+      assertThat(appHalfCloseLatch.getCount()).isEqualTo(1); // Half-close not processed yet
+
+      // Now let sidecar complete the drain
+      sidecarFinishLatch.countDown();
+
+      // Wait for the delegate half-close to be processed
+      assertThat(appHalfCloseLatch.await(5, TimeUnit.SECONDS)).isTrue();
+
+      // Verify delivery order: mutated-msg-1, mutated-msg-2, client-msg-during-drain
+      assertThat(serverReceivedMessages).containsExactly(
+          "mutated-msg-1", "mutated-msg-2", "client-msg-during-drain").inOrder();
+    } finally {
+      if (responseObserverRef.get() != null) {
+        try {
+          responseObserverRef.get().onCompleted();
+        } catch (IllegalStateException ignored) {}
+      }
+      channelManager.close();
+    }
+  }
+
   // ============================================================================
-  // Category 13: Inbound Backpressure (request(n) / pendingRequests)
+  // Category 14: Inbound Backpressure (request(n) / pendingRequests)
   // ============================================================================
 
   @Test
@@ -5622,7 +6577,7 @@ public class ExternalProcessorServerInterceptorTest {
 
 
   // ============================================================================
-  // Category 14: Error Handling & Security
+  // Category 15: Error Handling & Security
   // ============================================================================
 
   @Test
@@ -5768,7 +6723,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 15: Immediate Response Handling
+  // Category 16: Immediate Response Handling
   // ============================================================================
 
   @Test
@@ -6109,7 +7064,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 16: Resource Management
+  // Category 17: Resource Management
   // ============================================================================
 
   @Test
@@ -6121,7 +7076,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 17: Data plane rpc cancellation
+  // Category 18: Data plane rpc cancellation
   // ============================================================================
 
   @Test
@@ -6202,7 +7157,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 18: Flow Control when side stream is full
+  // Category 19: Flow Control when side stream is full
   // ============================================================================
 
   @Test
@@ -6483,7 +7438,7 @@ public class ExternalProcessorServerInterceptorTest {
 
 
   // ============================================================================
-  // Category 19: Streaming Completeness (Client & Bi-Di)
+  // Category 20: Streaming Completeness (Client & Bi-Di)
   // ============================================================================
 
   @Test
@@ -6683,7 +7638,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 20: Header Forwarding Rules
+  // Category 21: Header Forwarding Rules
   // ============================================================================
 
   @Test
@@ -7113,212 +8068,7 @@ public class ExternalProcessorServerInterceptorTest {
 
 
 
-  // ============================================================================
-  // Category 21: Response Trailers
-  // ============================================================================
 
-  @Test
-  public void serverInterceptor_responseTrailerMutation_mutatesTrailer() throws Exception {
-    ExternalProcessor proto = createBaseProto(extProcServerName)
-        .setProcessingMode(ProcessingMode.newBuilder()
-            .setResponseHeaderMode(ProcessingMode.HeaderSendMode.SKIP)
-            .setResponseTrailerMode(ProcessingMode.HeaderSendMode.SEND)
-            .build())
-        .build();
-    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
-        provider.parseFilterConfig(Any.pack(proto), filterContext);
-    assertThat(configOrError.errorDetail).isNull();
-    ExternalProcessorFilterConfig filterConfig = configOrError.config;
-
-    final CountDownLatch extProcLatch = new CountDownLatch(2); // 1 for request headers, 1 for response trailers
-    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
-        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
-          @Override
-          @SuppressWarnings("unchecked")
-          public StreamObserver<ProcessingRequest> process(
-              StreamObserver<ProcessingResponse> responseObserver) {
-            ((ServerCallStreamObserver<ProcessingResponse>) responseObserver).request(100);
-            return new StreamObserver<ProcessingRequest>() {
-              @Override
-              public void onNext(ProcessingRequest request) {
-                if (request.hasRequestHeaders()) {
-                  responseObserver.onNext(ProcessingResponse.newBuilder()
-                      .setRequestHeaders(HeadersResponse.newBuilder()
-                          .setResponse(CommonResponse.newBuilder().build())
-                          .build())
-                      .build());
-                  extProcLatch.countDown();
-                } else if (request.hasResponseTrailers()) {
-                  responseObserver.onNext(ProcessingResponse.newBuilder()
-                      .setResponseTrailers(TrailersResponse.newBuilder()
-                          .setHeaderMutation(HeaderMutation.newBuilder()
-                              .addSetHeaders(io.envoyproxy.envoy.config.core.v3.HeaderValueOption.newBuilder()
-                                  .setHeader(io.envoyproxy.envoy.config.core.v3.HeaderValue.newBuilder()
-                                      .setKey("x-mutated-trailer")
-                                      .setValue("mutated-trailer-value")
-                                      .build())
-                                  .build())
-                              .build())
-                          .build())
-                      .build());
-                  responseObserver.onCompleted();
-                  extProcLatch.countDown();
-                }
-              }
-
-              @Override public void onError(Throwable t) {}
-              @Override public void onCompleted() {}
-            };
-          }
-        };
-
-    grpcCleanup.register(InProcessServerBuilder.forName(extProcServerName)
-        .addService(extProcImpl)
-        .directExecutor()
-        .build().start());
-
-    CachedChannelManager channelManager = new CachedChannelManager(config -> {
-      return grpcCleanup.register(
-          InProcessChannelBuilder.forName(extProcServerName)
-              .directExecutor()
-              .build());
-    });
-
-    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
-        filterConfig, channelManager, FAKE_CONTEXT);
-
-    dataPlaneHandler = new DataPlaneServiceHandler() {
-      @Override
-      public void sayHello(InputStream request, StreamObserver<InputStream> responseObserver) {
-        responseObserver.onNext(request);
-        responseObserver.onCompleted();
-      }
-    };
-
-    startDataPlane(interceptor);
-
-    io.grpc.ClientCall<InputStream, InputStream> clientCall = dataPlaneChannel.newCall(
-        METHOD_SAY_HELLO_RAW, io.grpc.CallOptions.DEFAULT);
-
-    final AtomicReference<Metadata> receivedTrailers = new AtomicReference<>();
-    final CountDownLatch callCompletedLatch = new CountDownLatch(1);
-    clientCall.start(new io.grpc.ClientCall.Listener<InputStream>() {
-      @Override
-      public void onClose(Status status, Metadata trailers) {
-        receivedTrailers.set(trailers);
-        callCompletedLatch.countDown();
-      }
-    }, new Metadata());
-
-    clientCall.request(1);
-    clientCall.sendMessage(new ByteArrayInputStream("hello".getBytes(StandardCharsets.UTF_8)));
-    clientCall.halfClose();
-
-    assertThat(extProcLatch.await(5, TimeUnit.SECONDS)).isTrue();
-    assertThat(callCompletedLatch.await(5, TimeUnit.SECONDS)).isTrue();
-    assertThat(receivedTrailers.get()).isNotNull();
-    assertThat(receivedTrailers.get().get(Metadata.Key.of("x-mutated-trailer", Metadata.ASCII_STRING_MARSHALLER)))
-        .isEqualTo("mutated-trailer-value");
-  }
-
-  @Test
-  public void serverInterceptor_responseTrailerModeSkip_doesNotSendResponseTrailers() throws Exception {
-    ExternalProcessor proto = createBaseProto(extProcServerName)
-        .setProcessingMode(ProcessingMode.newBuilder()
-            .setResponseTrailerMode(ProcessingMode.HeaderSendMode.SKIP)
-            .build())
-        .build();
-    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
-        provider.parseFilterConfig(Any.pack(proto), filterContext);
-    assertThat(configOrError.errorDetail).isNull();
-    ExternalProcessorFilterConfig filterConfig = configOrError.config;
-
-    final CountDownLatch extProcLatch = new CountDownLatch(2); // 1 for request headers, 1 for response headers
-    final AtomicBoolean responseTrailersReceived = new AtomicBoolean(false);
-    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
-        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
-          @Override
-          @SuppressWarnings("unchecked")
-          public StreamObserver<ProcessingRequest> process(
-              StreamObserver<ProcessingResponse> responseObserver) {
-            ((ServerCallStreamObserver<ProcessingResponse>) responseObserver).request(100);
-            return new StreamObserver<ProcessingRequest>() {
-              @Override
-              public void onNext(ProcessingRequest request) {
-                if (request.hasRequestHeaders()) {
-                  responseObserver.onNext(ProcessingResponse.newBuilder()
-                      .setRequestHeaders(HeadersResponse.newBuilder()
-                          .setResponse(CommonResponse.newBuilder().build())
-                          .build())
-                      .build());
-                  extProcLatch.countDown();
-                } else if (request.hasResponseHeaders()) {
-                  responseObserver.onNext(ProcessingResponse.newBuilder()
-                      .setResponseHeaders(HeadersResponse.newBuilder()
-                          .setResponse(CommonResponse.newBuilder().build())
-                          .build())
-                      .build());
-                  extProcLatch.countDown();
-                } else if (request.hasResponseTrailers()) {
-                  responseTrailersReceived.set(true);
-                } else if (request.hasResponseBody()) {
-                  responseObserver.onCompleted();
-                }
-              }
-
-              @Override public void onError(Throwable t) {}
-              @Override public void onCompleted() {}
-            };
-          }
-        };
-
-    grpcCleanup.register(InProcessServerBuilder.forName(extProcServerName)
-        .addService(extProcImpl)
-        .directExecutor()
-        .build().start());
-
-    CachedChannelManager channelManager = new CachedChannelManager(config -> {
-      return grpcCleanup.register(
-          InProcessChannelBuilder.forName(extProcServerName)
-              .directExecutor()
-              .build());
-    });
-
-    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
-        filterConfig, channelManager, FAKE_CONTEXT);
-
-    dataPlaneHandler = new DataPlaneServiceHandler() {
-      @Override
-      public void sayHello(InputStream request, StreamObserver<InputStream> responseObserver) {
-        responseObserver.onNext(request);
-        responseObserver.onCompleted();
-      }
-    };
-
-    startDataPlane(interceptor);
-
-    io.grpc.ClientCall<InputStream, InputStream> clientCall = dataPlaneChannel.newCall(
-        METHOD_SAY_HELLO_RAW, io.grpc.CallOptions.DEFAULT);
-
-    final AtomicReference<Metadata> receivedTrailers = new AtomicReference<>();
-    final CountDownLatch callCompletedLatch = new CountDownLatch(1);
-    clientCall.start(new io.grpc.ClientCall.Listener<InputStream>() {
-      @Override
-      public void onClose(Status status, Metadata trailers) {
-        receivedTrailers.set(trailers);
-        callCompletedLatch.countDown();
-      }
-    }, new Metadata());
-
-    clientCall.request(1);
-    clientCall.sendMessage(new ByteArrayInputStream("hello".getBytes(StandardCharsets.UTF_8)));
-    clientCall.halfClose();
-
-    assertThat(extProcLatch.await(5, TimeUnit.SECONDS)).isTrue();
-    assertThat(callCompletedLatch.await(5, TimeUnit.SECONDS)).isTrue();
-    assertThat(responseTrailersReceived.get()).isFalse();
-    assertThat(receivedTrailers.get()).isNotNull();
-  }
 
   // ============================================================================
   // Category 22: Response Ordering Checks
