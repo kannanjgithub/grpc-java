@@ -336,6 +336,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     final AtomicBoolean halfClosed = new AtomicBoolean(false);
     final AtomicBoolean requestSideClosed = new AtomicBoolean(false);
     final AtomicBoolean dataPlaneCallClosed = new AtomicBoolean(false);
+    final AtomicBoolean bodyMessageSentToExtProc = new AtomicBoolean(false);
 
     final AtomicBoolean isProcessingTrailers = new AtomicBoolean(false);
     final AtomicBoolean responseHeadersSent = new AtomicBoolean(false);
@@ -425,7 +426,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     }
 
     private void activateCall() {
-      if ((extProcStreamState.get() == ExtProcStreamState.FAILED && !config.getFailureModeAllow())
+      if ((extProcStreamState.get() == ExtProcStreamState.FAILED
+              && (!config.getFailureModeAllow() || bodyMessageSentToExtProc.get()))
           || !dataPlaneCallState.compareAndSet(
               DataPlaneCallState.IDLE, DataPlaneCallState.ACTIVE)) {
         return;
@@ -645,10 +647,10 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
             synchronized (streamLock) {
               extProcClientCallRequestObserver = null;
             }
-            if (config.getFailureModeAllow()) {
+            if (config.getFailureModeAllow() && !bodyMessageSentToExtProc.get()) {
               handleFailOpen();
             } else {
-              rawCall.close(Status.UNAVAILABLE.withDescription("External processor stream failed").withCause(t), new Metadata());
+              rawCall.close(Status.INTERNAL.withDescription("External processor stream failed").withCause(t), new Metadata());
             }
           }
         }
@@ -783,10 +785,10 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
           }
         }
         expectedResponses.clear();
-        if (config.getFailureModeAllow()) {
+        if (config.getFailureModeAllow() && !bodyMessageSentToExtProc.get()) {
           handleFailOpen();
         } else {
-          rawCall.close(Status.UNAVAILABLE.withDescription("External processor stream failed").withCause(t), new Metadata());
+          rawCall.close(Status.INTERNAL.withDescription("External processor stream failed").withCause(t), new Metadata());
         }
       }
     }
@@ -961,9 +963,10 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     @Override
     public void close(Status status, Metadata trailers) {
       serverTrailersStartNanos = System.nanoTime();
-      if (isExtProcStreamFailed() && !config.getFailureModeAllow()) {
+      if (isExtProcStreamFailed()
+          && (!config.getFailureModeAllow() || bodyMessageSentToExtProc.get())) {
         if (markDataPlaneCallClosed()) {
-          proceedWithClose(Status.UNAVAILABLE.withDescription("External processor stream failed").withCause(status.getCause()), new Metadata());
+          proceedWithClose(Status.INTERNAL.withDescription("External processor stream failed").withCause(status.getCause()), new Metadata());
         }
         return;
       }
@@ -1088,6 +1091,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       HttpBody.Builder bodyBuilder = HttpBody.newBuilder();
       if (bodyByteString != null) {
         bodyBuilder.setBody(bodyByteString);
+        bodyMessageSentToExtProc.set(true);
       }
       bodyBuilder.setEndOfStream(endOfStream);
 
@@ -1390,6 +1394,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       if (bodyByteString != null) {
         bodyBuilder.setBody(bodyByteString);
         bodyBuilder.setEndOfStream(endOfStream);
+        dataPlaneServerCall.bodyMessageSentToExtProc.set(true);
       } else {
         bodyBuilder.setEndOfStreamWithoutMessage(true);
       }
