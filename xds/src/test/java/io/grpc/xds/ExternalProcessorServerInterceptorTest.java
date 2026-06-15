@@ -6918,13 +6918,85 @@ public class ExternalProcessorServerInterceptorTest {
     clientCall.sendMessage(new ByteArrayInputStream("hello".getBytes(StandardCharsets.UTF_8)));
     clientCall.halfClose();
 
-    // Verify stream failed
-    assertThat(extProcLatch.await(5, TimeUnit.SECONDS)).isTrue();
     // Verify call completed and failed with INTERNAL status (not fail-open)
     assertThat(callCompletedLatch.await(5, TimeUnit.SECONDS)).isTrue();
     assertThat(callStarted.get()).isTrue();
     assertThat(closedStatus.get().getCode()).isEqualTo(Status.Code.INTERNAL);
     assertThat(closedStatus.get().getDescription()).contains("External processor stream failed");
+  }
+
+  @Test
+  public void givenObservabilityTrue_whenExtProcStreamFails_thenCallContinues() throws Exception {
+    ExternalProcessor proto = createBaseProto(extProcServerName)
+        .setObservabilityMode(true)
+        .build();
+    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
+        provider.parseFilterConfig(Any.pack(proto), filterContext);
+    assertThat(configOrError.errorDetail).isNull();
+    ExternalProcessorFilterConfig filterConfig = configOrError.config;
+
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          public StreamObserver<ProcessingRequest> process(
+              StreamObserver<ProcessingResponse> responseObserver) {
+            responseObserver.onError(Status.UNAVAILABLE.withDescription("ExtProc down").asRuntimeException());
+            return new StreamObserver<ProcessingRequest>() {
+              @Override public void onNext(ProcessingRequest request) {}
+              @Override public void onError(Throwable t) {}
+              @Override public void onCompleted() {}
+            };
+          }
+        };
+
+    grpcCleanup.register(InProcessServerBuilder.forName(extProcServerName)
+        .addService(extProcImpl)
+        .directExecutor()
+        .build().start());
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(extProcServerName)
+              .directExecutor()
+              .build());
+    });
+
+    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
+        filterConfig, channelManager, FAKE_CONTEXT);
+
+    final AtomicBoolean callStarted = new AtomicBoolean(false);
+    dataPlaneHandler = new DataPlaneServiceHandler() {
+      @Override
+      public void sayHello(InputStream request, StreamObserver<InputStream> responseObserver) {
+        callStarted.set(true);
+        responseObserver.onNext(request);
+        responseObserver.onCompleted();
+      }
+    };
+
+    startDataPlane(interceptor);
+
+    io.grpc.ClientCall<InputStream, InputStream> clientCall = dataPlaneChannel.newCall(
+        METHOD_SAY_HELLO_RAW, io.grpc.CallOptions.DEFAULT);
+
+    final CountDownLatch callCompletedLatch = new CountDownLatch(1);
+    final AtomicReference<Status> closedStatus = new AtomicReference<>();
+    clientCall.start(new io.grpc.ClientCall.Listener<InputStream>() {
+      @Override
+      public void onClose(Status status, Metadata trailers) {
+        closedStatus.set(status);
+        callCompletedLatch.countDown();
+      }
+    }, new Metadata());
+
+    clientCall.request(1);
+    clientCall.sendMessage(new ByteArrayInputStream("hello".getBytes(StandardCharsets.UTF_8)));
+    clientCall.halfClose();
+
+    assertThat(callCompletedLatch.await(5, TimeUnit.SECONDS)).isTrue();
+    // Verify call completed and succeeded with OK status even though stream failed
+    assertThat(callStarted.get()).isTrue();
+    assertThat(closedStatus.get().getCode()).isEqualTo(Status.Code.OK);
   }
 
   // ============================================================================

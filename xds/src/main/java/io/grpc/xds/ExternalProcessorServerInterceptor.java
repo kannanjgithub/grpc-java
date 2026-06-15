@@ -427,6 +427,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     private void activateCall() {
       if ((extProcStreamState.get() == ExtProcStreamState.FAILED
+              && !config.getObservabilityMode()
               && (!config.getFailureModeAllow() || bodyMessageSentToExtProc.get()))
           || !dataPlaneCallState.compareAndSet(
               DataPlaneCallState.IDLE, DataPlaneCallState.ACTIVE)) {
@@ -647,7 +648,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
             synchronized (streamLock) {
               extProcClientCallRequestObserver = null;
             }
-            if (config.getFailureModeAllow() && !bodyMessageSentToExtProc.get()) {
+            if (config.getObservabilityMode()
+                || (config.getFailureModeAllow() && !bodyMessageSentToExtProc.get())) {
               handleFailOpen();
             } else {
               rawCall.close(Status.INTERNAL.withDescription("External processor stream failed").withCause(t), new Metadata());
@@ -785,7 +787,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
           }
         }
         expectedResponses.clear();
-        if (config.getFailureModeAllow() && !bodyMessageSentToExtProc.get()) {
+        if (config.getObservabilityMode()
+            || (config.getFailureModeAllow() && !bodyMessageSentToExtProc.get())) {
           handleFailOpen();
         } else {
           rawCall.close(Status.INTERNAL.withDescription("External processor stream failed").withCause(t), new Metadata());
@@ -964,6 +967,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     public void close(Status status, Metadata trailers) {
       serverTrailersStartNanos = System.nanoTime();
       if (isExtProcStreamFailed()
+          && !config.getObservabilityMode()
           && (!config.getFailureModeAllow() || bodyMessageSentToExtProc.get())) {
         if (markDataPlaneCallClosed()) {
           proceedWithClose(Status.INTERNAL.withDescription("External processor stream failed").withCause(status.getCause()), new Metadata());
