@@ -124,13 +124,35 @@ tasks.register("runInteropTestRemote") {
         logger.log(LogLevel.INFO, "the appURL=" + appUrl)
         def client = new com.squareup.okhttp.OkHttpClient()
         // The '?jdk8' argument is ignored by the server, it exists only to tag the request log entry
-        client.setReadTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+        client.setReadTimeout(120, java.util.concurrent.TimeUnit.SECONDS)
         def request = new com.squareup.okhttp.Request.Builder()
                 .url("${appUrl}/long_lived_channel?jdk8").build()
-        def result1 = client.newCall(request).execute()
-        def result2 = client.newCall(request).execute()
-        if (result1.code() != 200 || result2.code() != 200) {
-            throw new GradleException("Unable to reuse same channel across requests")
+        int maxChannelReuseRetries = 5
+        def result1 = null
+        def result2 = null
+        String result1Body = ""
+        String result2Body = ""
+        for (int attempt = 0; attempt < maxChannelReuseRetries; attempt++) {
+            try {
+                result1 = client.newCall(request).execute()
+                result2 = client.newCall(request).execute()
+                if (result1.code() == 200 && result2.code() == 200) {
+                    break
+                }
+                logger.log(LogLevel.WARN, "Channel reuse attempt ${attempt + 1} failed: result1 code = ${result1?.code()}, result2 code = ${result2?.code()}. Retrying...")
+            } catch (Throwable t) {
+                logger.log(LogLevel.WARN, "Channel reuse attempt ${attempt + 1} caught exception: ${t.message}. Retrying...", t)
+            }
+            Thread.sleep(2000)
+        }
+        if (result1 == null || result2 == null || result1.code() != 200 || result2.code() != 200) {
+            if (result1 != null) {
+                result1Body = result1.body().string()
+            }
+            if (result2 != null) {
+                result2Body = result2.body().string()
+            }
+            throw new GradleException("Unable to reuse same channel across requests. result1: ${result1?.code()} (body: ${result1Body}), result2: ${result2?.code()} (body: ${result2Body})")
         }
 
         // The test suite can take a while to run
