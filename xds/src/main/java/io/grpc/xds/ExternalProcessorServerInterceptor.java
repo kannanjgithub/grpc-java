@@ -30,7 +30,6 @@ import com.google.common.io.BaseEncoding;
 import com.google.common.io.ByteStreams;
 import com.google.common.util.concurrent.MoreExecutors;
 import com.google.protobuf.ByteString;
-import com.google.protobuf.UnsafeByteOperations;
 import com.google.protobuf.Struct;
 import com.google.protobuf.Value;
 import io.envoyproxy.envoy.config.core.v3.HeaderMap;
@@ -48,11 +47,9 @@ import io.envoyproxy.envoy.service.ext_proc.v3.ProcessingRequest;
 import io.envoyproxy.envoy.service.ext_proc.v3.ProcessingResponse;
 import io.envoyproxy.envoy.service.ext_proc.v3.ProtocolConfiguration;
 import io.envoyproxy.envoy.service.ext_proc.v3.StreamedBodyResponse;
-import io.grpc.Detachable;
 import io.grpc.Drainable;
 import io.grpc.DoubleHistogramMetricInstrument;
 import io.grpc.Context;
-import io.grpc.HasByteBuffer;
 import io.grpc.KnownLength;
 import io.grpc.ForwardingServerCall.SimpleForwardingServerCall;
 import io.grpc.ForwardingServerCallListener.SimpleForwardingServerCallListener;
@@ -86,8 +83,6 @@ import io.grpc.xds.internal.headermutations.HeaderValueOption;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
-import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -141,7 +136,6 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
         extProcStub = extProcStub.withDeadlineAfter(timeoutNanos, TimeUnit.NANOSECONDS);
       }
     }
-
 
     Context callContext = Context.current();
 
@@ -931,13 +925,23 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
         // Check-Then-Act: Atomically verify headers sending state and queue message
         if (savedResponseHeaders != null) {
-          savedOutgoingMessages.add(message);
+          try {
+            ByteString copiedBytes = ByteString.readFrom(message);
+            savedOutgoingMessages.add(new KnownLengthInputStream(copiedBytes));
+          } catch (IOException e) {
+            rawCall.close(Status.INTERNAL.withDescription("Failed to serialize response body").withCause(e), new Metadata());
+          }
           return;
         }
 
         // Check-Then-Act: Atomically verify stream draining state and queue message
         if (isExtProcStreamDraining() || isExtProcStreamCompleted()) {
-          pendingDrainingMessages.add(message);
+          try {
+            ByteString copiedBytes = ByteString.readFrom(message);
+            pendingDrainingMessages.add(new KnownLengthInputStream(copiedBytes));
+          } catch (IOException e) {
+            rawCall.close(Status.INTERNAL.withDescription("Failed to serialize response body").withCause(e), new Metadata());
+          }
           return;
         }
       }
@@ -955,7 +959,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
         if (config.getObservabilityMode()) {
           synchronized (rawCallLock) {
-            super.sendMessage(new OutboundZeroCopyInputStream(bodyByteString));
+            super.sendMessage(new KnownLengthInputStream(bodyByteString));
           }
         }
       } catch (IOException e) {
@@ -1128,7 +1132,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
         BodyMutation mutation = bodyResponse.getResponse().getBodyMutation();
         if (mutation.hasStreamedResponse()) {
           StreamedBodyResponse streamed = mutation.getStreamedResponse();
-          super.sendMessage(new OutboundZeroCopyInputStream(streamed.getBody()));
+          super.sendMessage(new KnownLengthInputStream(streamed.getBody()));
         }
       }
     }
@@ -1297,9 +1301,15 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
             || dataPlaneServerCall.config.getObservabilityMode()) {
 
           if (del == null || dataPlaneServerCall.isExtProcStreamDraining()) {
-            // We must buffer because the application call hasn't started yet, delegate is not set,
-            // or the stream is draining.
-            savedMessages.add(message);
+            // Synchronously copy to the heap to prevent deframer buffer recycling
+            try {
+              ByteString copiedBytes = ByteString.readFrom(message);
+              savedMessages.add(new KnownLengthInputStream(copiedBytes));
+            } catch (IOException e) {
+              dataPlaneServerCall.rawCall.close(
+                  Status.INTERNAL.withDescription("Failed to buffer client request").withCause(e),
+                  new Metadata());
+            }
           } else {
             dataPlaneServerCall.callContext.run(() -> del.onMessage(message));
           }
@@ -1308,7 +1318,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
         // Mode is GRPC and not in observability mode: dispatch immediately to ext_proc!
         try {
-          ByteString bodyByteString = inboundStreamToByteString(message);
+          ByteString bodyByteString = ByteString.readFrom(message);
           sendRequestBodyToExtProc(bodyByteString, false);
         } catch (IOException e) {
           dataPlaneServerCall.rawCall.close(
@@ -1380,10 +1390,12 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     void onExternalBody(ByteString body) {
       ServerCall.Listener<InputStream> del = delegate;
+      // In the future, if zero-copy reads are needed downstream, this can be optimized
+      // by wrapping the ByteString in an InputStream that implements HasByteBuffer, KnownLength, and Detachable.
       if (del != null) {
-        dataPlaneServerCall.callContext.run(() -> del.onMessage(new InboundZeroCopyInputStream(body)));
+        dataPlaneServerCall.callContext.run(() -> del.onMessage(body.newInput()));
       } else {
-        savedMessages.add(new InboundZeroCopyInputStream(body));
+        savedMessages.add(body.newInput());
       }
     }
 
@@ -1431,24 +1443,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     }
   }
 
-  private static ByteString inboundStreamToByteString(InputStream message) throws IOException {
-    if (message == null) {
-      return ByteString.EMPTY;
-    }
-    if (message instanceof HasByteBuffer && ((HasByteBuffer) message).byteBufferSupported()) {
-      ByteBuffer byteBuffer = ((HasByteBuffer) message).getByteBuffer();
-      if (byteBuffer != null) {
-        return UnsafeByteOperations.unsafeWrap(byteBuffer);
-      }
-    }
-    byte[] bodyBytes = ByteStreams.toByteArray(message);
-    return ByteString.copyFrom(bodyBytes);
-  }
-
   private static ByteString outboundStreamToByteString(InputStream message) throws IOException {
-    if (message == null) {
-      return ByteString.EMPTY;
-    }
     if (message instanceof Drainable) {
       int size = message.available();
       ByteString.Output output =
@@ -1456,18 +1451,14 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       ((Drainable) message).drainTo(output);
       return output.toByteString();
     }
-    byte[] bodyBytes = ByteStreams.toByteArray(message);
-    return ByteString.copyFrom(bodyBytes);
+    return ByteString.readFrom(message);
   }
 
-  private static final class InboundZeroCopyInputStream extends InputStream
-      implements HasByteBuffer, Detachable, KnownLength {
-    private final ByteString byteString;
+  private static final class KnownLengthInputStream extends InputStream
+      implements KnownLength {
     private final InputStream delegate;
-    private boolean detached = false;
 
-    InboundZeroCopyInputStream(ByteString byteString) {
-      this.byteString = byteString;
+    KnownLengthInputStream(ByteString byteString) {
       this.delegate = byteString.newInput();
     }
 
@@ -1489,81 +1480,6 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     @Override
     public void close() throws IOException {
       delegate.close();
-    }
-
-    @Override
-    public boolean markSupported() {
-      return delegate.markSupported();
-    }
-
-    @Override
-    public void mark(int readlimit) {
-      delegate.mark(readlimit);
-    }
-
-    @Override
-    public void reset() throws IOException {
-      delegate.reset();
-    }
-
-    @Override
-    public boolean byteBufferSupported() {
-      return !detached;
-    }
-
-    @Override
-    public ByteBuffer getByteBuffer() {
-      if (detached) {
-        throw new IllegalStateException("Stream has been detached");
-      }
-      return byteString.asReadOnlyByteBuffer();
-    }
-
-    @Override
-    public InputStream detach() {
-      if (detached) {
-        throw new IllegalStateException("Stream already detached");
-      }
-      detached = true;
-      return delegate;
-    }
-  }
-
-  private static final class OutboundZeroCopyInputStream extends InputStream
-      implements Drainable, KnownLength {
-    private final ByteString byteString;
-    private final InputStream delegate;
-
-    OutboundZeroCopyInputStream(ByteString byteString) {
-      this.byteString = byteString;
-      this.delegate = byteString.newInput();
-    }
-
-    @Override
-    public int read() throws IOException {
-      return delegate.read();
-    }
-
-    @Override
-    public int read(byte[] b, int off, int len) throws IOException {
-      return delegate.read(b, off, len);
-    }
-
-    @Override
-    public int available() throws IOException {
-      return delegate.available();
-    }
-
-    @Override
-    public void close() throws IOException {
-      delegate.close();
-    }
-
-    @Override
-    public int drainTo(OutputStream target) throws IOException {
-      int size = byteString.size();
-      byteString.writeTo(target);
-      return size;
     }
   }
 }
