@@ -40,11 +40,15 @@ public abstract class GrpcServiceConfig {
 
   public abstract Optional<Duration> timeout();
 
+  public abstract ImmutableList<HeaderValue> initialMetadata();
+
   @AutoValue.Builder
   public abstract static class Builder {
     public abstract Builder googleGrpc(GoogleGrpcConfig googleGrpc);
 
     public abstract Builder timeout(Duration timeout);
+
+    public abstract Builder initialMetadata(ImmutableList<HeaderValue> initialMetadata);
 
     public abstract GrpcServiceConfig build();
   }

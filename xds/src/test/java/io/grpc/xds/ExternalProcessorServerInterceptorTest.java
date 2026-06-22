@@ -1095,7 +1095,135 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 4: Request attributes propagation
+  // Category 4: GrpcService Initial Metadata
+  // ============================================================================
+
+  @Test
+  public void givenGrpcServiceWithInitialMetadata_whenCallIntercepted_thenSendsMetadata()
+      throws Exception {
+    String uniqueExtProcServerName = InProcessServerBuilder.generateName();
+
+    final AtomicReference<Metadata> capturedHeaders = new AtomicReference<>();
+    final CountDownLatch extProcStartedLatch = new CountDownLatch(1);
+
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          public StreamObserver<ProcessingRequest> process(
+              final StreamObserver<ProcessingResponse> responseObserver) {
+            ((ServerCallStreamObserver<ProcessingResponse>) responseObserver).request(100);
+            return new StreamObserver<ProcessingRequest>() {
+              @Override
+              public void onNext(ProcessingRequest request) {
+                if (request.hasRequestHeaders()) {
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setRequestHeaders(HeadersResponse.newBuilder().build())
+                      .build());
+                }
+              }
+              @Override public void onError(Throwable t) {}
+              @Override public void onCompleted() {
+                responseObserver.onCompleted();
+              }
+            };
+          }
+        };
+
+    ServerInterceptor headerCapturingInterceptor = new ServerInterceptor() {
+      @Override
+      public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+          ServerCall<ReqT, RespT> call, Metadata headers, ServerCallHandler<ReqT, RespT> next) {
+        capturedHeaders.set(headers);
+        extProcStartedLatch.countDown();
+        return next.startCall(call, headers);
+      }
+    };
+
+    grpcCleanup.register(InProcessServerBuilder.forName(uniqueExtProcServerName)
+        .addService(ServerInterceptors.intercept(extProcImpl, headerCapturingInterceptor))
+        .directExecutor()
+        .build().start());
+
+    // Config with initial metadata
+    ExternalProcessor.Builder protoBuilder = createBaseProto(uniqueExtProcServerName);
+    protoBuilder.setProcessingMode(ProcessingMode.newBuilder()
+        .setRequestHeaderMode(ProcessingMode.HeaderSendMode.SEND)
+        .setResponseHeaderMode(ProcessingMode.HeaderSendMode.SKIP)
+        .build());
+    protoBuilder.getGrpcServiceBuilder()
+        .addInitialMetadata(io.envoyproxy.envoy.config.core.v3.HeaderValue.newBuilder()
+            .setKey("x-init-key").setValue("init-val").build())
+        .addInitialMetadata(
+            io.envoyproxy.envoy.config.core.v3.HeaderValue.newBuilder()
+                .setKey("x-bin-key-bin")
+                .setRawValue(ByteString.copyFrom(new byte[] {1, 2, 3}))
+                .build());
+    ExternalProcessor proto = protoBuilder.build();
+
+    ExternalProcessorFilterConfig filterConfig =
+        provider.parseFilterConfig(Any.pack(proto), filterContext).config;
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(uniqueExtProcServerName).directExecutor().build());
+    });
+
+    ExternalProcessorServerInterceptor interceptor = new ExternalProcessorServerInterceptor(
+        filterConfig, channelManager, FAKE_CONTEXT);
+
+    dataPlaneHandler = new DataPlaneServiceHandler() {
+      @Override
+      public void sayHello(InputStream request, StreamObserver<InputStream> responseObserver) {
+        responseObserver.onNext(request);
+        responseObserver.onCompleted();
+      }
+    };
+
+    startDataPlane(interceptor);
+
+    io.grpc.ClientCall<InputStream, InputStream> clientCall = dataPlaneChannel.newCall(
+        METHOD_SAY_HELLO_RAW, io.grpc.CallOptions.DEFAULT);
+
+    final CountDownLatch callCompletedLatch = new CountDownLatch(1);
+    final AtomicReference<Status> callStatus = new AtomicReference<>();
+    clientCall.start(new io.grpc.ClientCall.Listener<InputStream>() {
+      @Override
+      public void onClose(Status status, Metadata trailers) {
+        System.out.println("--- Client onClose: " + status + " ---");
+        callStatus.set(status);
+        callCompletedLatch.countDown();
+      }
+    }, new Metadata());
+
+    clientCall.request(1);
+    clientCall.sendMessage(new ByteArrayInputStream("hello".getBytes(StandardCharsets.UTF_8)));
+    clientCall.halfClose();
+
+    boolean sidecarAwaited = extProcStartedLatch.await(5, TimeUnit.SECONDS);
+    System.out.println("--- sidecarAwaited: " + sidecarAwaited + " ---");
+    boolean completedAwaited = callCompletedLatch.await(5, TimeUnit.SECONDS);
+    System.out.println("--- completedAwaited: " + completedAwaited + " ---");
+    System.out.println("--- callStatus: " + callStatus.get() + " ---");
+
+    assertThat(sidecarAwaited).isTrue();
+    assertThat(completedAwaited).isTrue();
+    assertThat(callStatus.get().isOk()).isTrue();
+
+    assertThat(capturedHeaders.get()).isNotNull();
+    assertThat(
+            capturedHeaders
+                .get()
+                .get(Metadata.Key.of("x-init-key", Metadata.ASCII_STRING_MARSHALLER)))
+        .isEqualTo("init-val");
+    assertThat(
+            capturedHeaders
+                .get()
+                .get(Metadata.Key.of("x-bin-key-bin", Metadata.BINARY_BYTE_MARSHALLER)))
+        .isEqualTo(new byte[] {1, 2, 3});
+  }
+
+  // ============================================================================
+  // Category 5: Request attributes propagation
   // ============================================================================
 
   @Test
@@ -1568,7 +1696,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 5: Request Header Processing
+  // Category 6: Request Header Processing
   // ============================================================================
 @Test
   public void givenRequestHeaderModeSend_whenStartCallCalled_thenCallIsBuffered() throws Exception {
@@ -1959,7 +2087,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
     // ============================================================================
-  // Category 6: Body Mutation: Inbound/Request (GRPC Mode)
+  // Category 7: Body Mutation: Inbound/Request (GRPC Mode)
   // ============================================================================
 
   @Test
@@ -2488,7 +2616,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 7: Response Header Mutation
+  // Category 8: Response Header Mutation
   // ============================================================================
 
   @Test
@@ -2732,7 +2860,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 8: Body Mutation: Outbound/Response (GRPC Mode)
+  // Category 9: Body Mutation: Outbound/Response (GRPC Mode)
   // ============================================================================
 
   @Test
@@ -3392,7 +3520,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 9: Response Trailers
+  // Category 10: Response Trailers
   // ============================================================================
 
   @Test
@@ -3780,7 +3908,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 10: Trailers-Only Response Handling
+  // Category 11: Trailers-Only Response Handling
   // ============================================================================
 
   @Test
@@ -4116,7 +4244,7 @@ public class ExternalProcessorServerInterceptorTest {
 
 
   // ============================================================================
-  // Category 11: Half-Close handling
+  // Category 12: Half-Close handling
   // ============================================================================
 
   @Test
@@ -4799,7 +4927,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 12: Outbound Backpressure (isReady / onReady)
+  // Category 13: Outbound Backpressure (isReady / onReady)
   // ============================================================================
 
   @Test
@@ -5227,7 +5355,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 13: Ext-proc request draining
+  // Category 14: Ext-proc request draining
   // ============================================================================
 
   @Test
@@ -6311,7 +6439,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 14: Inbound Backpressure (request(n) / pendingRequests)
+  // Category 15: Inbound Backpressure (request(n) / pendingRequests)
   // ============================================================================
 
   @Test
@@ -6577,7 +6705,7 @@ public class ExternalProcessorServerInterceptorTest {
 
 
   // ============================================================================
-  // Category 15: Error Handling & Security
+  // Category 16: Error Handling & Security
   // ============================================================================
 
   @Test
@@ -7000,7 +7128,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 16: Immediate Response Handling
+  // Category 17: Immediate Response Handling
   // ============================================================================
 
   @Test
@@ -7341,7 +7469,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 17: Resource Management
+  // Category 18: Resource Management
   // ============================================================================
 
   @Test
@@ -7353,7 +7481,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 18: Data plane rpc cancellation
+  // Category 19: Data plane rpc cancellation
   // ============================================================================
 
   @Test
@@ -7434,7 +7562,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 19: Flow Control when side stream is full
+  // Category 20: Flow Control when side stream is full
   // ============================================================================
 
   @Test
@@ -7715,7 +7843,7 @@ public class ExternalProcessorServerInterceptorTest {
 
 
   // ============================================================================
-  // Category 20: Streaming Completeness (Client & Bi-Di)
+  // Category 21: Streaming Completeness (Client & Bi-Di)
   // ============================================================================
 
   @Test
@@ -7915,7 +8043,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 21: Header Forwarding Rules
+  // Category 22: Header Forwarding Rules
   // ============================================================================
 
   @Test
@@ -8348,7 +8476,7 @@ public class ExternalProcessorServerInterceptorTest {
 
 
   // ============================================================================
-  // Category 22: Response Ordering Checks
+  // Category 23: Response Ordering Checks
   // ============================================================================
 
   @Test
@@ -8543,7 +8671,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 23: Header Response Status Checks
+  // Category 24: Header Response Status Checks
   // ============================================================================
 
   @Test
@@ -8727,7 +8855,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   // ============================================================================
-  // Category 24: Concurrency and Thread Safety (Serialization)
+  // Category 25: Concurrency and Thread Safety (Serialization)
   // ============================================================================
 
   private static class ConcurrencyDetectingServerCall extends io.grpc.ForwardingServerCall.SimpleForwardingServerCall<InputStream, InputStream> {
@@ -9209,7 +9337,7 @@ public class ExternalProcessorServerInterceptorTest {
     assertThat(rawCall.concurrentCallDetected.get()).isFalse();
   }
 
-  // Category 25: Request-Scoped Context Propagation
+  // Category 26: Request-Scoped Context Propagation
   @Test
   public void serverInterceptor_contextPropagatedToStartCall() throws Exception {
     ExternalProcessor proto = createBaseProto(extProcServerName).build();

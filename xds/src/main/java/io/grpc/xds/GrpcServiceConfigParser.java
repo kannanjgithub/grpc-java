@@ -93,6 +93,22 @@ final class GrpcServiceConfigParser {
 
     GrpcServiceConfig.Builder builder = GrpcServiceConfig.builder().googleGrpc(googleGrpcConfig);
 
+    ImmutableList.Builder<HeaderValue> initialMetadata = ImmutableList.builder();
+    for (io.envoyproxy.envoy.config.core.v3.HeaderValue header : grpcServiceProto
+        .getInitialMetadataList()) {
+      String key = header.getKey();
+      HeaderValue headerValue;
+      if (key.endsWith(Metadata.BINARY_HEADER_SUFFIX)) {
+        headerValue = HeaderValue.create(key, header.getRawValue());
+      } else {
+        headerValue = HeaderValue.create(key, header.getValue());
+      }
+      if (HeaderValueValidationUtils.isDisallowed(headerValue)) {
+        throw new GrpcServiceParseException("Invalid initial metadata header: " + key);
+      }
+      initialMetadata.add(headerValue);
+    }
+    builder.initialMetadata(initialMetadata.build());
 
     if (grpcServiceProto.hasTimeout()) {
       com.google.protobuf.Duration timeout = grpcServiceProto.getTimeout();
