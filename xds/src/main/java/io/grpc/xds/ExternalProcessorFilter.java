@@ -69,7 +69,6 @@ import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.internal.DelayedClientCall;
 import io.grpc.internal.GrpcUtil;
-import io.grpc.internal.SerializingExecutor;
 import io.grpc.stub.ClientCallStreamObserver;
 import io.grpc.stub.ClientResponseObserver;
 import io.grpc.stub.MetadataUtils;

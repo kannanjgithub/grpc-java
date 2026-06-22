@@ -361,7 +361,7 @@ public class ExternalProcessorServerInterceptorTest {
 
   @Test
   @SuppressWarnings("unchecked")
-  public void givenInterceptor_whenCallIntercepted_thenExtProcStubUsesSerializingExecutor()
+  public void givenInterceptor_whenCallIntercepted_thenExtProcStubUsesSynchronizationContext()
       throws Exception {
     String uniqueExtProcServerName = InProcessServerBuilder.generateName();
     ExternalProcessor proto = ExternalProcessor.newBuilder()
@@ -454,7 +454,7 @@ public class ExternalProcessorServerInterceptorTest {
           new SimpleServerCall(METHOD_SAY_HELLO_RAW), new Metadata(), nextHandler);
 
       assertThat(capturedExecutor.get()).isNotNull();
-      assertThat(capturedExecutor.get().getClass().getName()).contains("SerializingExecutor");
+      assertThat(capturedExecutor.get().getClass().getName()).contains("SynchronizationContext");
     } finally {
       if (responseObserverRef.get() != null) {
         responseObserverRef.get().onCompleted();

@@ -63,7 +63,9 @@ import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.internal.GrpcUtil;
 import io.grpc.internal.SharedResourceHolder;
-import io.grpc.internal.SerializingExecutor;
+import io.grpc.SynchronizationContext;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import io.grpc.stub.ClientCallStreamObserver;
 import io.grpc.stub.ClientResponseObserver;
 import io.grpc.stub.MetadataUtils;
@@ -98,6 +100,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import javax.annotation.Nullable;
 
 final class ExternalProcessorServerInterceptor implements ServerInterceptor {
+  private static final Logger logger = Logger.getLogger(ExternalProcessorServerInterceptor.class.getName());
+
   private final CachedChannelManager cachedChannelManager;
   private final ExternalProcessorFilterConfig filterConfig;
   private final MetricRecorder metricsRecorder;
@@ -310,7 +314,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     private final ServerCall<InputStream, InputStream> rawCall;
     private final ExternalProcessorGrpc.ExternalProcessorStub extProcStub;
-    private final SerializingExecutor delegateExecutor;
+    private final SynchronizationContext syncContext;
     private final ExternalProcessorFilterConfig config;
     private final ScheduledExecutorService scheduler;
     private final Object streamLock = new Object();
@@ -373,8 +377,16 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
         Context callContext) {
       super(rawCall);
       this.rawCall = rawCall;
-      this.delegateExecutor = new SerializingExecutor(MoreExecutors.directExecutor());
-      this.extProcStub = extProcStub.withExecutor(this.delegateExecutor);
+      this.syncContext = new SynchronizationContext(new Thread.UncaughtExceptionHandler() {
+        @Override
+        public void uncaughtException(Thread t, Throwable e) {
+          logger.log(
+              Level.SEVERE,
+              "Uncaught exception in ExternalProcessorServerInterceptor SynchronizationContext",
+              e);
+        }
+      });
+      this.extProcStub = extProcStub.withExecutor(this.syncContext);
       this.config = config;
       this.currentProcessingMode = config.getExternalProcessor().getProcessingMode();
       this.mutationFilter = new HeaderMutationFilter(mutationRulesConfig);
@@ -1255,7 +1267,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     }
 
     void setDelegate(ServerCall.Listener<InputStream> delegate) {
-      dataPlaneServerCall.delegateExecutor.execute(() -> {
+      dataPlaneServerCall.syncContext.execute(() -> {
         this.delegate = delegate;
         dataPlaneServerCall.callContext.run(() -> {
           InputStream msg;
@@ -1270,7 +1282,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     }
 
     void drainSavedMessages() {
-      dataPlaneServerCall.delegateExecutor.execute(() -> {
+      dataPlaneServerCall.syncContext.execute(() -> {
         ServerCall.Listener<InputStream> del = delegate;
         if (del != null) {
           dataPlaneServerCall.callContext.run(() -> {
@@ -1288,7 +1300,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     @Override
     public void onReady() {
-      dataPlaneServerCall.delegateExecutor.execute(() -> {
+      dataPlaneServerCall.syncContext.execute(() -> {
         dataPlaneServerCall.drainPendingRequests();
         onReadyNotify();
       });
@@ -1303,7 +1315,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     @Override
     public void onMessage(InputStream message) {
-      dataPlaneServerCall.delegateExecutor.execute(() -> {
+      dataPlaneServerCall.syncContext.execute(() -> {
         if (dataPlaneServerCall.requestSideClosed.get()) {
           return;
         }
@@ -1352,7 +1364,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     @Override
     public void onHalfClose() {
-      dataPlaneServerCall.delegateExecutor.execute(() -> {
+      dataPlaneServerCall.syncContext.execute(() -> {
         if (dataPlaneServerCall.requestSideClosed.get()) {
           return;
         }
@@ -1383,7 +1395,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     }
 
     void handleDeferredHalfClose() {
-      dataPlaneServerCall.delegateExecutor.execute(() -> {
+      dataPlaneServerCall.syncContext.execute(() -> {
         if (dataPlaneServerCall.currentProcessingMode.getRequestBodyMode() == ProcessingMode.BodySendMode.NONE
             || dataPlaneServerCall.isExtProcStreamCompleted()) {
           proceedWithHalfClose();
@@ -1444,7 +1456,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     @Override
     public void onCancel() {
-      dataPlaneServerCall.delegateExecutor.execute(() -> {
+      dataPlaneServerCall.syncContext.execute(() -> {
         dataPlaneServerCall.cancelExtProcStream(
             Status.CANCELLED.withDescription("Client cancelled RPC").asRuntimeException());
         ServerCall.Listener<InputStream> del = delegate;
@@ -1456,7 +1468,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     @Override
     public void onComplete() {
-      dataPlaneServerCall.delegateExecutor.execute(() -> {
+      dataPlaneServerCall.syncContext.execute(() -> {
         ServerCall.Listener<InputStream> del = delegate;
         if (del != null) {
           dataPlaneServerCall.callContext.run(del::onComplete);
