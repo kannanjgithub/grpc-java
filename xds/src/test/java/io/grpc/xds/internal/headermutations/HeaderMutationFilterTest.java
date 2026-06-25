@@ -21,8 +21,8 @@ import static org.junit.Assert.assertThrows;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
-import com.google.protobuf.ByteString;
 import com.google.re2j.Pattern;
+import io.grpc.xds.internal.grpcservice.HeaderValue;
 import io.grpc.xds.internal.headermutations.HeaderValueOption.HeaderAppendAction;
 import java.util.Optional;
 import org.junit.Test;
@@ -34,14 +34,9 @@ public class HeaderMutationFilterTest {
 
   private static final int MAX_HEADER_LENGTH = 16384;
 
-  private static HeaderValueOption header(String key, ByteString value) {
-    return HeaderValueOption.create(io.grpc.xds.internal.grpcservice.HeaderValue.create(key, value),
-        HeaderAppendAction.APPEND_IF_EXISTS_OR_ADD, false);
-  }
-
   private static HeaderValueOption header(String key, String value) {
-    return HeaderValueOption.create(io.grpc.xds.internal.grpcservice.HeaderValue.create(key, value),
-        HeaderAppendAction.APPEND_IF_EXISTS_OR_ADD, false);
+    return HeaderValueOption.create(HeaderValue.create(key, value),
+        HeaderAppendAction.APPEND_IF_EXISTS_OR_ADD);
   }
 
   @Test
@@ -49,7 +44,6 @@ public class HeaderMutationFilterTest {
     HeaderMutationFilter filter = new HeaderMutationFilter(Optional.empty());
     @SuppressWarnings("InlineMeInliner")
     String longString = Strings.repeat("a", MAX_HEADER_LENGTH + 1);
-    ByteString longBytes = ByteString.copyFrom(new byte[MAX_HEADER_LENGTH + 1]);
 
     HeaderMutations mutations = HeaderMutations.create(
         ImmutableList.of(
@@ -59,7 +53,12 @@ public class HeaderMutationFilterTest {
             header(":path", "/new-path"), header(":grpc-trace-bin", "binary-value"),
             header(":alt-svc", "h3=:443"), header("user-agent", "new-agent"),
             header("Valid-Key", "value"), header("", "value"), header(longString, "value"),
-            header("long-value-key", longString), header("long-bin-key-bin", longBytes),
+            HeaderValueOption.create(
+                HeaderValue.createInvalid("long-value-key"),
+                HeaderAppendAction.APPEND_IF_EXISTS_OR_ADD),
+            HeaderValueOption.create(
+                HeaderValue.createInvalid("long-bin-key-bin"),
+                HeaderAppendAction.APPEND_IF_EXISTS_OR_ADD),
             header("grpc-timeout", "10S"), header("valid-key-lower", "value")),
         ImmutableList.of("remove-key", "host", ":authority", ":scheme", ":method", ":foo", ":bar",
             "Valid-Key", "", longString, "grpc-timeout", "UPPER-REMOVE", "lower-remove"));
