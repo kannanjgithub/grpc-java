@@ -1204,7 +1204,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       if (isProcessingTrailers.get()) {
         unblockAfterStreamComplete();
       } else {
-        rawCall.close(status, trailers);
+        proceedWithClose(status, trailers);
         unblockAfterStreamComplete();
       }
       closeExtProcStream();
