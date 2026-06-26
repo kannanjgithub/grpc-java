@@ -17,8 +17,8 @@
 package io.grpc.xds;
 
 import static com.google.common.base.Preconditions.checkNotNull;
-import static io.grpc.xds.ExternalProcessorFilter.clientHeadersDuration;
 import static io.grpc.xds.ExternalProcessorFilter.clientHalfCloseDuration;
+import static io.grpc.xds.ExternalProcessorFilter.clientHeadersDuration;
 import static io.grpc.xds.ExternalProcessorFilter.serverHeadersDuration;
 import static io.grpc.xds.ExternalProcessorFilter.serverTrailersDuration;
 
@@ -27,7 +27,6 @@ import com.google.common.base.Joiner;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.io.BaseEncoding;
-import com.google.common.io.ByteStreams;
 import com.google.common.util.concurrent.MoreExecutors;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Struct;
@@ -47,12 +46,12 @@ import io.envoyproxy.envoy.service.ext_proc.v3.ProcessingRequest;
 import io.envoyproxy.envoy.service.ext_proc.v3.ProcessingResponse;
 import io.envoyproxy.envoy.service.ext_proc.v3.ProtocolConfiguration;
 import io.envoyproxy.envoy.service.ext_proc.v3.StreamedBodyResponse;
-import io.grpc.Drainable;
-import io.grpc.DoubleHistogramMetricInstrument;
 import io.grpc.Context;
-import io.grpc.KnownLength;
+import io.grpc.DoubleHistogramMetricInstrument;
+import io.grpc.Drainable;
 import io.grpc.ForwardingServerCall.SimpleForwardingServerCall;
-import io.grpc.ForwardingServerCallListener.SimpleForwardingServerCallListener;
+import io.grpc.KnownLength;
+import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
 import io.grpc.MetricRecorder;
@@ -61,11 +60,9 @@ import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
+import io.grpc.SynchronizationContext;
 import io.grpc.internal.GrpcUtil;
 import io.grpc.internal.SharedResourceHolder;
-import io.grpc.SynchronizationContext;
-import java.util.logging.Level;
-import java.util.logging.Logger;
 import io.grpc.stub.ClientCallStreamObserver;
 import io.grpc.stub.ClientResponseObserver;
 import io.grpc.stub.MetadataUtils;
@@ -83,7 +80,6 @@ import io.grpc.xds.internal.headermutations.HeaderMutationRulesConfig;
 import io.grpc.xds.internal.headermutations.HeaderMutations;
 import io.grpc.xds.internal.headermutations.HeaderMutator;
 import io.grpc.xds.internal.headermutations.HeaderValueOption;
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
@@ -98,26 +94,34 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import javax.annotation.Nullable;
 
 final class ExternalProcessorServerInterceptor implements ServerInterceptor {
   private static final Logger logger = Logger.getLogger(ExternalProcessorServerInterceptor.class.getName());
 
-  private final CachedChannelManager cachedChannelManager;
   private final ExternalProcessorFilterConfig filterConfig;
   private final MetricRecorder metricsRecorder;
+  private final ManagedChannel extProcChannel;
 
   ExternalProcessorServerInterceptor(
       ExternalProcessorFilterConfig filterConfig,
       CachedChannelManager cachedChannelManager,
       FilterContext context) {
     this.filterConfig = checkNotNull(filterConfig, "filterConfig");
-    this.cachedChannelManager = checkNotNull(cachedChannelManager, "cachedChannelManager");
+    checkNotNull(cachedChannelManager, "cachedChannelManager");
     this.metricsRecorder = checkNotNull(context.metricsRecorder(), "metricsRecorder");
+    this.extProcChannel = cachedChannelManager.getChannel(filterConfig.getGrpcServiceConfig());
   }
 
   ExternalProcessorFilterConfig getFilterConfig() {
     return filterConfig;
+  }
+
+  @VisibleForTesting
+  ManagedChannel getExtProcChannel() {
+    return extProcChannel;
   }
 
 
@@ -132,7 +136,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     ScheduledExecutorService scheduler = SharedResourceHolder.get(GrpcUtil.TIMER_SERVICE);
     ExternalProcessorGrpc.ExternalProcessorStub extProcStub = ExternalProcessorGrpc.newStub(
-        cachedChannelManager.getChannel(filterConfig.getGrpcServiceConfig()))
+        extProcChannel)
         .withExecutor(MoreExecutors.directExecutor());
 
     if (filterConfig.getGrpcServiceConfig().timeout().isPresent()) {
@@ -1181,7 +1185,9 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
         BodyMutation mutation = bodyResponse.getResponse().getBodyMutation();
         if (mutation.hasStreamedResponse()) {
           StreamedBodyResponse streamed = mutation.getStreamedResponse();
-          super.sendMessage(new KnownLengthInputStream(streamed.getBody()));
+          if (!streamed.getEndOfStreamWithoutMessage()) {
+            super.sendMessage(new KnownLengthInputStream(streamed.getBody()));
+          }
         }
       }
     }
@@ -1222,6 +1228,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     private void handleFailOpen() {
       activateCall();
+      drainPendingRequests();
       proceedWithSendHeaders();
       drainPendingDrainingMessages();
       unblockAfterStreamComplete();
@@ -1385,8 +1392,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
         }
         dataPlaneServerCall.clientHalfCloseStartNanos = System.nanoTime();
         dataPlaneServerCall.halfClosed.set(true);
+        halfCloseReceived = true;
         if (dataPlaneServerCall.isExtProcStreamDraining()) {
-          halfCloseReceived = true;
           return;
         }
         ServerCall.Listener<InputStream> del = delegate;
