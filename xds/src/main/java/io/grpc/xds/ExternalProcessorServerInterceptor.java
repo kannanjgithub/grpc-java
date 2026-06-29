@@ -129,10 +129,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
   @SuppressWarnings("unchecked")
   public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
       ServerCall<ReqT, RespT> call, Metadata headers, ServerCallHandler<ReqT, RespT> next) {
-    ServerCall<InputStream, InputStream> rawCall =
-        (ServerCall<InputStream, InputStream>) (ServerCall<?, ?>) call;
-    ServerCallHandler<InputStream, InputStream> rawNext =
-        (ServerCallHandler<InputStream, InputStream>) (ServerCallHandler<?, ?>) next;
+    ServerCall<InputStream, InputStream> rawCall = (ServerCall<InputStream, InputStream>) call;
+    ServerCallHandler<InputStream, InputStream> rawNext = (ServerCallHandler<InputStream, InputStream>) next;
 
     ScheduledExecutorService scheduler = SharedResourceHolder.get(GrpcUtil.TIMER_SERVICE);
     ExternalProcessorGrpc.ExternalProcessorStub extProcStub = ExternalProcessorGrpc.newStub(
@@ -177,7 +175,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     dataPlaneServerCall.start();
 
-    return (ServerCall.Listener<ReqT>) (ServerCall.Listener<?>) dataPlaneServerCall.getListener();
+    return (ServerCall.Listener<ReqT>) dataPlaneServerCall.getListener();
   }
 
   private static HeaderMap toHeaderMap(
