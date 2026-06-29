@@ -18,6 +18,7 @@ package io.grpc.xds;
 
 import static com.google.common.base.Preconditions.checkNotNull;
 import static io.grpc.xds.ExternalProcessorUtil.outboundStreamToByteString;
+import static io.grpc.xds.ExternalProcessorUtil.toHeaderMap;
 import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.clientHalfCloseDuration;
 import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.clientHeadersDuration;
 import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.serverHeadersDuration;
@@ -133,7 +134,6 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     ServerCall<InputStream, InputStream> rawCall = (ServerCall<InputStream, InputStream>) call;
     ServerCallHandler<InputStream, InputStream> rawNext = (ServerCallHandler<InputStream, InputStream>) next;
 
-    ScheduledExecutorService scheduler = SharedResourceHolder.get(GrpcUtil.TIMER_SERVICE);
     ExternalProcessorGrpc.ExternalProcessorStub extProcStub = ExternalProcessorGrpc.newStub(
         extProcChannel)
         .withExecutor(MoreExecutors.directExecutor());
@@ -171,52 +171,12 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     DataPlaneServerCall dataPlaneServerCall = new DataPlaneServerCall(
         rawCall, extProcStub, filterConfig, filterConfig.getMutationRulesConfig(),
-        scheduler, call.getMethodDescriptor(), metricsRecorder, call.getAuthority(), rawNext, headers,
-        callContext);
+        SharedResourceHolder.get(GrpcUtil.TIMER_SERVICE), call.getMethodDescriptor(),
+        metricsRecorder, call.getAuthority(), rawNext, headers, callContext);
 
     dataPlaneServerCall.start();
 
     return (ServerCall.Listener<ReqT>) dataPlaneServerCall.getListener();
-  }
-
-  private static HeaderMap toHeaderMap(
-      Metadata metadata, Optional<HeaderForwardingRulesConfig> forwardRules) {
-    HeaderMap.Builder builder = HeaderMap.newBuilder();
-
-    for (String key : metadata.keys()) {
-      if (forwardRules.isPresent() && !forwardRules.get().isAllowed(key)) {
-        continue;
-      }
-      if (key.endsWith(Metadata.BINARY_HEADER_SUFFIX)) {
-        Metadata.Key<byte[]> binKey = Metadata.Key.of(key, Metadata.BINARY_BYTE_MARSHALLER);
-        Iterable<byte[]> values = metadata.getAll(binKey);
-        if (values != null) {
-          for (byte[] binValue : values) {
-            String base64Value = BaseEncoding.base64().encode(binValue);
-            io.envoyproxy.envoy.config.core.v3.HeaderValue headerValue =
-                io.envoyproxy.envoy.config.core.v3.HeaderValue.newBuilder()
-                    .setKey(key.toLowerCase(Locale.ROOT))
-                    .setRawValue(ByteString.copyFromUtf8(base64Value))
-                    .build();
-            builder.addHeaders(headerValue);
-          }
-        }
-      } else {
-        Metadata.Key<String> asciiKey = Metadata.Key.of(key, Metadata.ASCII_STRING_MARSHALLER);
-        Iterable<String> values = metadata.getAll(asciiKey);
-        if (values != null) {
-          for (String value : values) {
-            io.envoyproxy.envoy.config.core.v3.HeaderValue headerValue =
-                io.envoyproxy.envoy.config.core.v3.HeaderValue.newBuilder()
-                    .setKey(key.toLowerCase(Locale.ROOT))
-                    .setRawValue(ByteString.copyFromUtf8(value))
-                    .build();
-            builder.addHeaders(headerValue);
-          }
-        }
-      }
-    }
-    return builder.build();
   }
 
   private static ImmutableMap<String, Struct> collectAttributes(
