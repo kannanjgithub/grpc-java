@@ -38,10 +38,9 @@ import io.grpc.Drainable;
 import io.grpc.MetricInstrumentRegistry;
 import io.grpc.ServerInterceptor;
 import io.grpc.internal.GrpcUtil;
-import io.grpc.xds.Filter.FilterConfigParseContext;
-import io.grpc.xds.Filter.FilterContext;
 import io.grpc.xds.internal.MatcherParser;
 import io.grpc.xds.internal.Matchers;
+import io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments;
 import io.grpc.xds.internal.grpcservice.CachedChannelManager;
 import io.grpc.xds.internal.grpcservice.GrpcServiceConfig;
 import io.grpc.xds.internal.grpcservice.GrpcServiceParseException;
@@ -64,75 +63,8 @@ public class ExternalProcessorFilter implements Filter {
   static final String TYPE_URL = 
       "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor";
 
-  @VisibleForTesting
-  static DoubleHistogramMetricInstrument clientHeadersDuration;
-  @VisibleForTesting
-  static DoubleHistogramMetricInstrument clientHalfCloseDuration;
-  @VisibleForTesting
-  static DoubleHistogramMetricInstrument serverHeadersDuration;
-  @VisibleForTesting
-  static DoubleHistogramMetricInstrument serverTrailersDuration;
-
-  // Copied from io.grpc.opentelemetry.internal.OpenTelemetryConstants.LATENCY_BUCKETS
-  private static final List<Double> LATENCY_BUCKETS = ImmutableList.of(
-      0d,     0.00001d, 0.00005d, 0.0001d, 0.0003d, 0.0006d, 0.0008d, 0.001d, 0.002d,
-      0.003d, 0.004d,   0.005d,   0.006d,  0.008d,  0.01d,   0.013d,  0.016d, 0.02d,
-      0.025d, 0.03d,    0.04d,    0.05d,   0.065d,  0.08d,   0.1d,    0.13d,  0.16d,
-      0.2d,   0.25d,    0.3d,     0.4d,    0.5d,    0.65d,   0.8d,    1d,     2d,
-      5d,     10d,      20d,      50d,     100d);
-
   static {
-    if (GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_CLIENT", false)
-        || GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_SERVER", false)) {
-      initMetricInstruments();
-    }
-  }
-
-  static synchronized void initMetricInstruments() {
-    if (clientHeadersDuration == null && (GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_CLIENT", false)
-        || GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_SERVER", false))) {
-      MetricInstrumentRegistry registry = MetricInstrumentRegistry.getDefaultRegistry();
-
-      clientHeadersDuration = registry.registerDoubleHistogram(
-          "grpc.client_ext_proc.client_headers_duration",
-          "Time between when the ext_proc filter sees the client's headers and when "
-              + "it allows those headers to continue on to the next filter",
-          "s",
-          LATENCY_BUCKETS,
-          ImmutableList.of("grpc.target"),
-          ImmutableList.of("grpc.lb.backend_service"),
-          true);
-
-      clientHalfCloseDuration = registry.registerDoubleHistogram(
-          "grpc.client_ext_proc.client_half_close_duration",
-          "Time between when the ext_proc filter sees the client's half-close and when "
-              + "it allows that half-close to continue on to the next filter",
-          "s",
-          LATENCY_BUCKETS,
-          ImmutableList.of("grpc.target"),
-          ImmutableList.of("grpc.lb.backend_service"),
-          true);
-
-      serverHeadersDuration = registry.registerDoubleHistogram(
-          "grpc.client_ext_proc.server_headers_duration",
-          "Time between when the ext_proc filter sees the server's headers and when "
-              + "it allows those headers to continue on to the next filter",
-          "s",
-          LATENCY_BUCKETS,
-          ImmutableList.of("grpc.target"),
-          ImmutableList.of("grpc.lb.backend_service"),
-          true);
-
-      serverTrailersDuration = registry.registerDoubleHistogram(
-          "grpc.client_ext_proc.server_trailers_duration",
-          "Time between when the ext_proc filter sees the server's trailers and when "
-              + "it allows those trailers to continue on to the next filter",
-          "s",
-          LATENCY_BUCKETS,
-          ImmutableList.of("grpc.target"),
-          ImmutableList.of("grpc.lb.backend_service"),
-          true);
-    }
+    ExternalProcessorMetricInstruments.initMetricInstruments();
   }
 
   enum ExtProcStreamState {

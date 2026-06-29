@@ -71,11 +71,14 @@ import io.grpc.stub.ServerCalls;
 import io.grpc.stub.StreamObserver;
 import io.grpc.testing.GrpcCleanupRule;
 import io.grpc.util.MutableHandlerRegistry;
-import io.grpc.xds.ExternalProcessorClientInterceptor;
+import io.grpc.xds.ConfigOrError;
 import io.grpc.xds.ExternalProcessorFilter.ExternalProcessorFilterConfig;
 import io.grpc.xds.ExternalProcessorFilter.ExternalProcessorFilterOverrideConfig;
+import io.grpc.xds.Filter;
+import io.grpc.xds.XdsNameResolver;
 import io.grpc.xds.client.Bootstrapper;
 import io.grpc.xds.client.EnvoyProtoData.Node;
+import io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments;
 import io.grpc.xds.internal.grpcservice.CachedChannelManager;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -7323,6 +7326,7 @@ public class ExternalProcessorClientInterceptorTest {
     final AtomicReference<Metadata> appReceivedTrailers = new AtomicReference<>();
     final CountDownLatch appCloseLatch = new CountDownLatch(1);
     final CountDownLatch mutatedMsg1ReceivedLatch = new CountDownLatch(1);
+    final CountDownLatch mutatedMsg2ReceivedLatch = new CountDownLatch(1);
     
     ClientCall.Listener<String> appListener = new ClientCall.Listener<String>() {
       @Override
@@ -7335,6 +7339,8 @@ public class ExternalProcessorClientInterceptorTest {
         appReceivedMessages.add(message);
         if ("Mutated Message 1".equals(message)) {
           mutatedMsg1ReceivedLatch.countDown();
+        } else if ("Mutated Message 2".equals(message)) {
+          mutatedMsg2ReceivedLatch.countDown();
         }
       }
 
@@ -7387,8 +7393,9 @@ public class ExternalProcessorClientInterceptorTest {
     // 4. Signal sidecar to send Mutated Message 2
     m3SentLatch.countDown();
     
-    // Wait for sidecar to finish sending M2
+    // Wait for sidecar to finish sending M2 and app to receive it
     assertThat(respBody2Latch.await(5, TimeUnit.SECONDS)).isTrue();
+    assertThat(mutatedMsg2ReceivedLatch.await(5, TimeUnit.SECONDS)).isTrue();
 
     // Verify that Mutated Message 2 is delivered immediately to app upon arrival (even before
     // M3 is released)
@@ -12517,25 +12524,25 @@ public class ExternalProcessorClientInterceptorTest {
 
     // Verify that the 4 duration metrics were recorded with proper labels!
     Mockito.verify(mockMetricRecorder, Mockito.times(1)).recordDoubleHistogram(
-        Mockito.eq(ExternalProcessorFilter.clientHeadersDuration),
+        Mockito.eq(ExternalProcessorMetricInstruments.clientHeadersDuration),
         Mockito.anyDouble(),
         Mockito.eq(com.google.common.collect.ImmutableList.of("xds:///target-service-metric")),
         Mockito.eq(com.google.common.collect.ImmutableList.of("backend-service-metric")));
 
     Mockito.verify(mockMetricRecorder, Mockito.times(1)).recordDoubleHistogram(
-        Mockito.eq(ExternalProcessorFilter.clientHalfCloseDuration),
+        Mockito.eq(ExternalProcessorMetricInstruments.clientHalfCloseDuration),
         Mockito.anyDouble(),
         Mockito.eq(com.google.common.collect.ImmutableList.of("xds:///target-service-metric")),
         Mockito.eq(com.google.common.collect.ImmutableList.of("backend-service-metric")));
 
     Mockito.verify(mockMetricRecorder, Mockito.times(1)).recordDoubleHistogram(
-        Mockito.eq(ExternalProcessorFilter.serverHeadersDuration),
+        Mockito.eq(ExternalProcessorMetricInstruments.serverHeadersDuration),
         Mockito.anyDouble(),
         Mockito.eq(com.google.common.collect.ImmutableList.of("xds:///target-service-metric")),
         Mockito.eq(com.google.common.collect.ImmutableList.of("backend-service-metric")));
 
     Mockito.verify(mockMetricRecorder, Mockito.times(1)).recordDoubleHistogram(
-        Mockito.eq(ExternalProcessorFilter.serverTrailersDuration),
+        Mockito.eq(ExternalProcessorMetricInstruments.serverTrailersDuration),
         Mockito.anyDouble(),
         Mockito.eq(com.google.common.collect.ImmutableList.of("xds:///target-service-metric")),
         Mockito.eq(com.google.common.collect.ImmutableList.of("backend-service-metric")));
@@ -12687,25 +12694,25 @@ public class ExternalProcessorClientInterceptorTest {
 
     // Verify that the 4 duration metrics were recorded with proper labels!
     Mockito.verify(mockMetricRecorder, Mockito.times(1)).recordDoubleHistogram(
-        Mockito.eq(ExternalProcessorFilter.clientHeadersDuration),
+        Mockito.eq(ExternalProcessorMetricInstruments.clientHeadersDuration),
         Mockito.anyDouble(),
         Mockito.eq(com.google.common.collect.ImmutableList.of("xds:///target-service-metric-fail")),
         Mockito.eq(com.google.common.collect.ImmutableList.of("backend-service-metric-fail")));
 
     Mockito.verify(mockMetricRecorder, Mockito.times(1)).recordDoubleHistogram(
-        Mockito.eq(ExternalProcessorFilter.clientHalfCloseDuration),
+        Mockito.eq(ExternalProcessorMetricInstruments.clientHalfCloseDuration),
         Mockito.anyDouble(),
         Mockito.eq(com.google.common.collect.ImmutableList.of("xds:///target-service-metric-fail")),
         Mockito.eq(com.google.common.collect.ImmutableList.of("backend-service-metric-fail")));
 
     Mockito.verify(mockMetricRecorder, Mockito.times(1)).recordDoubleHistogram(
-        Mockito.eq(ExternalProcessorFilter.serverHeadersDuration),
+        Mockito.eq(ExternalProcessorMetricInstruments.serverHeadersDuration),
         Mockito.anyDouble(),
         Mockito.eq(com.google.common.collect.ImmutableList.of("xds:///target-service-metric-fail")),
         Mockito.eq(com.google.common.collect.ImmutableList.of("backend-service-metric-fail")));
 
     Mockito.verify(mockMetricRecorder, Mockito.times(1)).recordDoubleHistogram(
-        Mockito.eq(ExternalProcessorFilter.serverTrailersDuration),
+        Mockito.eq(ExternalProcessorMetricInstruments.serverTrailersDuration),
         Mockito.anyDouble(),
         Mockito.eq(com.google.common.collect.ImmutableList.of("xds:///target-service-metric-fail")),
         Mockito.eq(com.google.common.collect.ImmutableList.of("backend-service-metric-fail")));

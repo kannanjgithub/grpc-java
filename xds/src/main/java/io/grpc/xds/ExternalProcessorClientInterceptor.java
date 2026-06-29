@@ -17,11 +17,12 @@
 package io.grpc.xds;
 
 import static com.google.common.base.Preconditions.checkNotNull;
-import static io.grpc.xds.ExternalProcessorFilter.clientHalfCloseDuration;
-import static io.grpc.xds.ExternalProcessorFilter.clientHeadersDuration;
-import static io.grpc.xds.ExternalProcessorFilter.outboundStreamToByteString;
-import static io.grpc.xds.ExternalProcessorFilter.serverHeadersDuration;
-import static io.grpc.xds.ExternalProcessorFilter.serverTrailersDuration;
+import static io.grpc.xds.ExternalProcessorUtil.outboundStreamToByteString;
+import static io.grpc.xds.ExternalProcessorUtil.toHeaderMap;
+import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.clientHalfCloseDuration;
+import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.clientHeadersDuration;
+import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.serverHeadersDuration;
+import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.serverTrailersDuration;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
@@ -31,7 +32,6 @@ import com.google.common.io.BaseEncoding;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Struct;
 import com.google.protobuf.Value;
-import io.envoyproxy.envoy.config.core.v3.HeaderMap;
 import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ProcessingMode;
 import io.envoyproxy.envoy.service.ext_proc.v3.BodyMutation;
 import io.envoyproxy.envoy.service.ext_proc.v3.BodyResponse;
@@ -53,10 +53,8 @@ import io.grpc.ClientInterceptor;
 import io.grpc.Context;
 import io.grpc.Deadline;
 import io.grpc.DoubleHistogramMetricInstrument;
-import io.grpc.Drainable;
 import io.grpc.ForwardingClientCall.SimpleForwardingClientCall;
 import io.grpc.ForwardingClientCallListener.SimpleForwardingClientCallListener;
-import io.grpc.KnownLength;
 import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
@@ -64,16 +62,15 @@ import io.grpc.MetricRecorder;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.internal.DelayedClientCall;
-import io.grpc.internal.GrpcUtil;
 import io.grpc.internal.SerializingExecutor;
 import io.grpc.stub.ClientCallStreamObserver;
 import io.grpc.stub.ClientResponseObserver;
 import io.grpc.xds.ExternalProcessorFilter.DataPlaneCallState;
 import io.grpc.xds.ExternalProcessorFilter.ExtProcStreamState;
 import io.grpc.xds.ExternalProcessorFilter.ExternalProcessorFilterConfig;
-import io.grpc.xds.ExternalProcessorFilter.HeaderForwardingRulesConfig;
 import io.grpc.xds.Filter.FilterContext;
-import io.grpc.xds.internal.KnownLengthInputStream;
+import io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments;
+import io.grpc.xds.internal.extproc.KnownLengthInputStream;
 import io.grpc.xds.internal.grpcservice.CachedChannelManager;
 import io.grpc.xds.internal.grpcservice.HeaderValue;
 import io.grpc.xds.internal.grpcservice.HeaderValueValidationUtils;
@@ -119,7 +116,7 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
     checkNotNull(cachedChannelManager, "cachedChannelManager");
     this.scheduler = checkNotNull(scheduler, "scheduler");
     this.metricsRecorder = checkNotNull(context.metricsRecorder(), "metricsRecorder");
-    ExternalProcessorFilter.initMetricInstruments();
+    ExternalProcessorMetricInstruments.initMetricInstruments();
     this.extProcChannel = cachedChannelManager.getChannel(filterConfig.getGrpcServiceConfig());
   }
 
@@ -197,48 +194,6 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
   }
 
   // --- SHARED UTILITY METHODS ---
-  private static HeaderMap toHeaderMap(
-      Metadata metadata, Optional<HeaderForwardingRulesConfig> forwardRules) {
-    HeaderMap.Builder builder =
-        HeaderMap.newBuilder();
-
-    for (String key : metadata.keys()) {
-      if (forwardRules.isPresent() && !forwardRules.get().isAllowed(key)) {
-        continue;
-      }
-      // Map binary headers using raw_value
-      if (key.endsWith(Metadata.BINARY_HEADER_SUFFIX)) {
-        Metadata.Key<byte[]> binKey = Metadata.Key.of(key, Metadata.BINARY_BYTE_MARSHALLER);
-        Iterable<byte[]> values = metadata.getAll(binKey);
-        if (values != null) {
-          for (byte[] binValue : values) {
-            String base64Value = BaseEncoding.base64().encode(binValue);
-            io.envoyproxy.envoy.config.core.v3.HeaderValue headerValue =
-                io.envoyproxy.envoy.config.core.v3.HeaderValue.newBuilder()
-                    .setKey(key.toLowerCase(Locale.ROOT))
-                    .setRawValue(ByteString.copyFromUtf8(base64Value))
-                    .build();
-            builder.addHeaders(headerValue);
-          }
-        }
-      } else {
-        Metadata.Key<String> asciiKey = Metadata.Key.of(key, Metadata.ASCII_STRING_MARSHALLER);
-        Iterable<String> values = metadata.getAll(asciiKey);
-        if (values != null) {
-          for (String value : values) {
-            io.envoyproxy.envoy.config.core.v3.HeaderValue headerValue =
-                io.envoyproxy.envoy.config.core.v3.HeaderValue.newBuilder()
-                    .setKey(key.toLowerCase(Locale.ROOT))
-                    .setRawValue(ByteString.copyFromUtf8(value))
-                    .build();
-            builder.addHeaders(headerValue);
-          }
-        }
-      }
-    }
-    return builder.build();
-  }
-
   private static ImmutableMap<String, Struct> collectAttributes(
       ImmutableList<String> requestedAttributes,
       MethodDescriptor<?, ?> method,

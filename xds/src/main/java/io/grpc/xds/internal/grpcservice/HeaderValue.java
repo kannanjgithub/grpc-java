@@ -37,7 +37,6 @@ public abstract class HeaderValue {
     return new AutoValue_HeaderValue(key, Optional.empty(), Optional.of(rawValue));
   }
 
-
   public abstract String key();
 
   public abstract Optional<String> value();
