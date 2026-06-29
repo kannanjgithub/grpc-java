@@ -17,16 +17,20 @@
 package io.grpc.xds;
 
 import static com.google.common.base.Preconditions.checkNotNull;
+import static io.grpc.xds.ExternalProcessorUtil.collectAttributes;
+import static io.grpc.xds.ExternalProcessorUtil.outboundStreamToByteString;
+import static io.grpc.xds.ExternalProcessorUtil.toHeaderMap;
+import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.clientHalfCloseDuration;
+import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.clientHeadersDuration;
+import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.serverHeadersDuration;
+import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.serverTrailersDuration;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Joiner;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.io.BaseEncoding;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Struct;
-import com.google.protobuf.Value;
-import io.envoyproxy.envoy.config.core.v3.HeaderMap;
 import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ProcessingMode;
 import io.envoyproxy.envoy.service.ext_proc.v3.BodyMutation;
 import io.envoyproxy.envoy.service.ext_proc.v3.BodyResponse;
@@ -48,25 +52,24 @@ import io.grpc.ClientInterceptor;
 import io.grpc.Context;
 import io.grpc.Deadline;
 import io.grpc.DoubleHistogramMetricInstrument;
-import io.grpc.Drainable;
 import io.grpc.ForwardingClientCall.SimpleForwardingClientCall;
 import io.grpc.ForwardingClientCallListener.SimpleForwardingClientCallListener;
-import io.grpc.KnownLength;
 import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
-import io.grpc.MetricInstrumentRegistry;
 import io.grpc.MetricRecorder;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.internal.DelayedClientCall;
-import io.grpc.internal.GrpcUtil;
 import io.grpc.internal.SerializingExecutor;
 import io.grpc.stub.ClientCallStreamObserver;
 import io.grpc.stub.ClientResponseObserver;
+import io.grpc.xds.ExternalProcessorFilter.DataPlaneCallState;
+import io.grpc.xds.ExternalProcessorFilter.ExtProcStreamState;
 import io.grpc.xds.ExternalProcessorFilter.ExternalProcessorFilterConfig;
-import io.grpc.xds.ExternalProcessorFilter.HeaderForwardingRulesConfig;
 import io.grpc.xds.Filter.FilterContext;
+import io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments;
+import io.grpc.xds.internal.extproc.KnownLengthInputStream;
 import io.grpc.xds.internal.grpcservice.CachedChannelManager;
 import io.grpc.xds.internal.grpcservice.HeaderValue;
 import io.grpc.xds.internal.grpcservice.HeaderValueValidationUtils;
@@ -78,9 +81,6 @@ import io.grpc.xds.internal.headermutations.HeaderMutator;
 import io.grpc.xds.internal.headermutations.HeaderValueOption;
 import java.io.IOException;
 import java.io.InputStream;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Locale;
 import java.util.Optional;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -98,76 +98,6 @@ import javax.annotation.Nullable;
  */
 final class ExternalProcessorClientInterceptor implements ClientInterceptor {
 
-
-
-  @VisibleForTesting
-  static final DoubleHistogramMetricInstrument clientHeadersDuration;
-  @VisibleForTesting
-  static final DoubleHistogramMetricInstrument clientHalfCloseDuration;
-  @VisibleForTesting
-  static final DoubleHistogramMetricInstrument serverHeadersDuration;
-  @VisibleForTesting
-  static final DoubleHistogramMetricInstrument serverTrailersDuration;
-
-  // Copied from io.grpc.opentelemetry.internal.OpenTelemetryConstants.LATENCY_BUCKETS
-  private static final List<Double> LATENCY_BUCKETS = ImmutableList.of(
-      0d,     0.00001d, 0.00005d, 0.0001d, 0.0003d, 0.0006d, 0.0008d, 0.001d, 0.002d,
-      0.003d, 0.004d,   0.005d,   0.006d,  0.008d,  0.01d,   0.013d,  0.016d, 0.02d,
-      0.025d, 0.03d,    0.04d,    0.05d,   0.065d,  0.08d,   0.1d,    0.13d,  0.16d,
-      0.2d,   0.25d,    0.3d,     0.4d,    0.5d,    0.65d,   0.8d,    1d,     2d,
-      5d,     10d,      20d,      50d,     100d);
-
-  static {
-    if (GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_CLIENT", false)) {
-      MetricInstrumentRegistry registry = MetricInstrumentRegistry.getDefaultRegistry();
-
-      clientHeadersDuration = registry.registerDoubleHistogram(
-          "grpc.client_ext_proc.client_headers_duration",
-          "Time between when the ext_proc filter sees the client's headers and when "
-              + "it allows those headers to continue on to the next filter",
-          "s",
-          LATENCY_BUCKETS,
-          ImmutableList.of("grpc.target"),
-          ImmutableList.of("grpc.lb.backend_service"),
-          true);
-
-      clientHalfCloseDuration = registry.registerDoubleHistogram(
-          "grpc.client_ext_proc.client_half_close_duration",
-          "Time between when the ext_proc filter sees the client's half-close and when "
-              + "it allows that half-close to continue on to the next filter",
-          "s",
-          LATENCY_BUCKETS,
-          ImmutableList.of("grpc.target"),
-          ImmutableList.of("grpc.lb.backend_service"),
-          true);
-
-      serverHeadersDuration = registry.registerDoubleHistogram(
-          "grpc.client_ext_proc.server_headers_duration",
-          "Time between when the ext_proc filter sees the server's headers and when "
-              + "it allows those headers to continue on to the next filter",
-          "s",
-          LATENCY_BUCKETS,
-          ImmutableList.of("grpc.target"),
-          ImmutableList.of("grpc.lb.backend_service"),
-          true);
-
-      serverTrailersDuration = registry.registerDoubleHistogram(
-          "grpc.client_ext_proc.server_trailers_duration",
-          "Time between when the ext_proc filter sees the server's trailers and when "
-              + "it allows those trailers to continue on to the next filter",
-          "s",
-          LATENCY_BUCKETS,
-          ImmutableList.of("grpc.target"),
-          ImmutableList.of("grpc.lb.backend_service"),
-          true);
-    } else {
-      clientHeadersDuration = null;
-      clientHalfCloseDuration = null;
-      serverHeadersDuration = null;
-      serverTrailersDuration = null;
-    }
-  }
-
   private final ExternalProcessorFilterConfig filterConfig;
   private final ScheduledExecutorService scheduler;
   private final MetricRecorder metricsRecorder;
@@ -182,6 +112,7 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
     checkNotNull(cachedChannelManager, "cachedChannelManager");
     this.scheduler = checkNotNull(scheduler, "scheduler");
     this.metricsRecorder = checkNotNull(context.metricsRecorder(), "metricsRecorder");
+    ExternalProcessorMetricInstruments.initMetricInstruments();
     this.extProcChannel = cachedChannelManager.getChannel(filterConfig.getGrpcServiceConfig());
   }
 
@@ -259,137 +190,6 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
   }
 
   // --- SHARED UTILITY METHODS ---
-  private static HeaderMap toHeaderMap(
-      Metadata metadata, Optional<HeaderForwardingRulesConfig> forwardRules) {
-    HeaderMap.Builder builder =
-        HeaderMap.newBuilder();
-
-    for (String key : metadata.keys()) {
-      if (forwardRules.isPresent() && !forwardRules.get().isAllowed(key)) {
-        continue;
-      }
-      // Map binary headers using raw_value
-      if (key.endsWith(Metadata.BINARY_HEADER_SUFFIX)) {
-        Metadata.Key<byte[]> binKey = Metadata.Key.of(key, Metadata.BINARY_BYTE_MARSHALLER);
-        Iterable<byte[]> values = metadata.getAll(binKey);
-        if (values != null) {
-          for (byte[] binValue : values) {
-            String base64Value = BaseEncoding.base64().encode(binValue);
-            io.envoyproxy.envoy.config.core.v3.HeaderValue headerValue =
-                io.envoyproxy.envoy.config.core.v3.HeaderValue.newBuilder()
-                    .setKey(key.toLowerCase(Locale.ROOT))
-                    .setRawValue(ByteString.copyFromUtf8(base64Value))
-                    .build();
-            builder.addHeaders(headerValue);
-          }
-        }
-      } else {
-        Metadata.Key<String> asciiKey = Metadata.Key.of(key, Metadata.ASCII_STRING_MARSHALLER);
-        Iterable<String> values = metadata.getAll(asciiKey);
-        if (values != null) {
-          for (String value : values) {
-            io.envoyproxy.envoy.config.core.v3.HeaderValue headerValue =
-                io.envoyproxy.envoy.config.core.v3.HeaderValue.newBuilder()
-                    .setKey(key.toLowerCase(Locale.ROOT))
-                    .setRawValue(ByteString.copyFromUtf8(value))
-                    .build();
-            builder.addHeaders(headerValue);
-          }
-        }
-      }
-    }
-    return builder.build();
-  }
-
-  private static ImmutableMap<String, Struct> collectAttributes(
-      ImmutableList<String> requestedAttributes,
-      MethodDescriptor<?, ?> method,
-      Channel channel,
-      Metadata headers) {
-    if (requestedAttributes.isEmpty()) {
-      return ImmutableMap.of();
-    }
-    ImmutableMap.Builder<String, Struct> attributes = ImmutableMap.builder();
-    for (String attr : requestedAttributes) {
-      switch (attr) {
-        case "request.path":
-        case "request.url_path":
-          attributes.put(attr, encodeAttribute("/" + method.getFullMethodName()));
-          break;
-        case "request.host":
-          attributes.put(attr, encodeAttribute(channel.authority()));
-          break;
-        case "request.method":
-          attributes.put(attr, encodeAttribute("POST"));
-          break;
-        case "request.headers":
-          attributes.put(attr, encodeHeaders(headers));
-          break;
-        case "request.referer":
-          String referer = getHeaderValue(headers, "referer");
-          if (referer != null) {
-            attributes.put(attr, encodeAttribute(referer));
-          }
-          break;
-        case "request.useragent":
-          String ua = getHeaderValue(headers, "user-agent");
-          if (ua != null) {
-            attributes.put(attr, encodeAttribute(ua));
-          }
-          break;
-        case "request.id":
-          String id = getHeaderValue(headers, "x-request-id");
-          if (id != null) {
-            attributes.put(attr, encodeAttribute(id));
-          }
-          break;
-        case "request.query":
-          attributes.put(attr, encodeAttribute(""));
-          break;
-        default:
-          // "Not set" attributes or unrecognized ones (already validated) are skipped.
-          break;
-      }
-    }
-    return attributes.buildOrThrow();
-  }
-
-  private static Struct encodeAttribute(String value) {
-    return Struct.newBuilder()
-        .putFields("", Value.newBuilder().setStringValue(value).build())
-        .build();
-  }
-
-  private static Struct encodeHeaders(Metadata headers) {
-    Struct.Builder builder = Struct.newBuilder();
-    for (String key : headers.keys()) {
-      String value = getHeaderValue(headers, key);
-      if (value != null) {
-        builder.putFields(key.toLowerCase(Locale.ROOT),
-            Value.newBuilder().setStringValue(value).build());
-      }
-    }
-    return builder.build();
-  }
-
-  @Nullable
-  private static String getHeaderValue(Metadata headers, String headerName) {
-    if (headerName.endsWith(Metadata.BINARY_HEADER_SUFFIX)) {
-      Metadata.Key<byte[]> key = Metadata.Key.of(headerName, Metadata.BINARY_BYTE_MARSHALLER);
-      Iterable<byte[]> values = headers.getAll(key);
-      if (values == null) {
-        return null;
-      }
-      List<String> encoded = new ArrayList<>();
-      for (byte[] v : values) {
-        encoded.add(BaseEncoding.base64().omitPadding().encode(v));
-      }
-      return Joiner.on(",").join(encoded);
-    }
-    Metadata.Key<String> key = Metadata.Key.of(headerName, Metadata.ASCII_STRING_MARSHALLER);
-    Iterable<String> values = headers.getAll(key);
-    return values == null ? null : Joiner.on(",").join(values);
-  }
 
   /**
    * A local subclass to expose the protected constructor of DelayedClientCall.
@@ -407,31 +207,6 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
    */
   private static class DataPlaneClientCall 
       extends SimpleForwardingClientCall<InputStream, InputStream> {
-    enum ExtProcStreamState {
-      ACTIVE,
-      DRAINING,
-      COMPLETED,
-      FAILED;
-
-      boolean isCompleted() {
-        return this == COMPLETED || this == FAILED;
-      }
-
-      boolean isFailed() {
-        return this == FAILED;
-      }
-
-      boolean isDraining() {
-        return this == DRAINING;
-      }
-    }
-
-    enum DataPlaneCallState {
-      IDLE,
-      ACTIVE,
-      CLOSED
-    }
-
     private enum EventType {
       REQUEST_HEADERS,
       REQUEST_BODY,
@@ -848,7 +623,7 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
       });
 
       this.collectedAttributes = collectAttributes(
-          config.getRequestAttributes(), method, channel, headers);
+          config.getRequestAttributes(), method, channel.authority(), headers);
 
       boolean sendRequestHeaders =
           currentProcessingMode.getRequestHeaderMode() == ProcessingMode.HeaderSendMode.SEND
@@ -1395,7 +1170,7 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
     @Override
     public void onClose(Status status, Metadata trailers) {
       dataPlaneClientCall.setServerTrailersStartNanos(System.nanoTime());
-      DataPlaneClientCall.ExtProcStreamState extProcStreamState =
+      ExtProcStreamState extProcStreamState =
           dataPlaneClientCall.getExtProcStreamState().get();
       if (extProcStreamState.isFailed()
           && !dataPlaneClientCall.getConfig().getObservabilityMode()
@@ -1591,48 +1366,6 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
       dataPlaneClientCall.sendToExtProc(ProcessingRequest.newBuilder()
           .setResponseBody(bodyBuilder.build())
           .build());
-    }
-  }
-
-
-
-  private static ByteString outboundStreamToByteString(InputStream message) throws IOException {
-    if (message instanceof Drainable) {
-      int size = message.available();
-      ByteString.Output output =
-          size > 0 ? ByteString.newOutput(size) : ByteString.newOutput();
-      ((Drainable) message).drainTo(output);
-      return output.toByteString();
-    }
-    return ByteString.readFrom(message);
-  }
-
-  private static final class KnownLengthInputStream extends InputStream
-      implements KnownLength {
-    private final InputStream delegate;
-
-    KnownLengthInputStream(ByteString byteString) {
-      this.delegate = byteString.newInput();
-    }
-
-    @Override
-    public int read() throws IOException {
-      return delegate.read();
-    }
-
-    @Override
-    public int read(byte[] b, int off, int len) throws IOException {
-      return delegate.read(b, off, len);
-    }
-
-    @Override
-    public int available() throws IOException {
-      return delegate.available();
-    }
-
-    @Override
-    public void close() throws IOException {
-      delegate.close();
     }
   }
 }

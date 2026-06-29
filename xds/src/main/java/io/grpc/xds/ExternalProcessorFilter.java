@@ -33,10 +33,9 @@ import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.HeaderForwardingR
 import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ProcessingMode;
 import io.grpc.ClientInterceptor;
 import io.grpc.internal.GrpcUtil;
-import io.grpc.xds.Filter.FilterConfigParseContext;
-import io.grpc.xds.Filter.FilterContext;
 import io.grpc.xds.internal.MatcherParser;
 import io.grpc.xds.internal.Matchers;
+import io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments;
 import io.grpc.xds.internal.grpcservice.CachedChannelManager;
 import io.grpc.xds.internal.grpcservice.GrpcServiceConfig;
 import io.grpc.xds.internal.grpcservice.GrpcServiceParseException;
@@ -56,6 +55,35 @@ import javax.annotation.Nullable;
 public class ExternalProcessorFilter implements Filter {
   static final String TYPE_URL = 
       "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor";
+
+  static {
+    ExternalProcessorMetricInstruments.initMetricInstruments();
+  }
+
+  enum ExtProcStreamState {
+    ACTIVE,
+    DRAINING,
+    COMPLETED,
+    FAILED;
+
+    boolean isCompleted() {
+      return this == COMPLETED || this == FAILED;
+    }
+
+    boolean isFailed() {
+      return this == FAILED;
+    }
+
+    boolean isDraining() {
+      return this == DRAINING;
+    }
+  }
+
+  enum DataPlaneCallState {
+    IDLE,
+    ACTIVE,
+    CLOSED
+  }
 
   private final CachedChannelManager cachedChannelManager;
   private final FilterContext context;
