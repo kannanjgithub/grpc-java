@@ -100,6 +100,9 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
 
+/**
+ * Server-side interceptor for external processing filter.
+ */
 final class ExternalProcessorServerInterceptor implements ServerInterceptor {
   private static final Logger logger = Logger.getLogger(ExternalProcessorServerInterceptor.class.getName());
 
@@ -121,12 +124,6 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
   ExternalProcessorFilterConfig getFilterConfig() {
     return filterConfig;
   }
-
-  @VisibleForTesting
-  ManagedChannel getExtProcChannel() {
-    return extProcChannel;
-  }
-
 
   @Override
   @SuppressWarnings("unchecked")
