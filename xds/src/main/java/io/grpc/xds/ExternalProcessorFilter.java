@@ -19,59 +19,20 @@ package io.grpc.xds;
 import static com.google.common.base.Preconditions.checkNotNull;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Joiner;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableMap;
-import com.google.common.io.BaseEncoding;
-import com.google.common.io.ByteStreams;
 import com.google.protobuf.Any;
-import com.google.protobuf.ByteString;
 import com.google.protobuf.Duration;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Message;
-import com.google.protobuf.Struct;
-import com.google.protobuf.Value;
 import com.google.protobuf.util.Durations;
 import io.envoyproxy.envoy.config.core.v3.GrpcService;
-import io.envoyproxy.envoy.config.core.v3.HeaderMap;
 import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ExtProcOverrides;
 import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute;
 import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor;
 import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.HeaderForwardingRules;
 import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ProcessingMode;
-import io.envoyproxy.envoy.service.ext_proc.v3.BodyMutation;
-import io.envoyproxy.envoy.service.ext_proc.v3.BodyResponse;
-import io.envoyproxy.envoy.service.ext_proc.v3.CommonResponse;
-import io.envoyproxy.envoy.service.ext_proc.v3.ExternalProcessorGrpc;
-import io.envoyproxy.envoy.service.ext_proc.v3.HeaderMutation;
-import io.envoyproxy.envoy.service.ext_proc.v3.HttpBody;
-import io.envoyproxy.envoy.service.ext_proc.v3.HttpHeaders;
-import io.envoyproxy.envoy.service.ext_proc.v3.HttpTrailers;
-import io.envoyproxy.envoy.service.ext_proc.v3.ImmediateResponse;
-import io.envoyproxy.envoy.service.ext_proc.v3.ProcessingRequest;
-import io.envoyproxy.envoy.service.ext_proc.v3.ProcessingResponse;
-import io.envoyproxy.envoy.service.ext_proc.v3.ProtocolConfiguration;
-import io.envoyproxy.envoy.service.ext_proc.v3.StreamedBodyResponse;
-import io.grpc.CallOptions;
-import io.grpc.Channel;
-import io.grpc.ClientCall;
 import io.grpc.ClientInterceptor;
-import io.grpc.Deadline;
-import io.grpc.DoubleHistogramMetricInstrument;
-import io.grpc.ForwardingClientCall.SimpleForwardingClientCall;
-import io.grpc.ForwardingClientCallListener.SimpleForwardingClientCallListener;
-import io.grpc.Metadata;
-import io.grpc.MethodDescriptor;
-import io.grpc.MetricInstrumentRegistry;
-import io.grpc.MetricRecorder;
-import io.grpc.ServerInterceptor;
-import io.grpc.Status;
-import io.grpc.StatusRuntimeException;
-import io.grpc.internal.DelayedClientCall;
 import io.grpc.internal.GrpcUtil;
-import io.grpc.stub.ClientCallStreamObserver;
-import io.grpc.stub.ClientResponseObserver;
-import io.grpc.stub.MetadataUtils;
 import io.grpc.xds.Filter.FilterConfigParseContext;
 import io.grpc.xds.Filter.FilterContext;
 import io.grpc.xds.internal.MatcherParser;
@@ -79,30 +40,14 @@ import io.grpc.xds.internal.Matchers;
 import io.grpc.xds.internal.grpcservice.CachedChannelManager;
 import io.grpc.xds.internal.grpcservice.GrpcServiceConfig;
 import io.grpc.xds.internal.grpcservice.GrpcServiceParseException;
-import io.grpc.xds.internal.headermutations.HeaderMutationDisallowedException;
-import io.grpc.xds.internal.headermutations.HeaderMutationFilter;
 import io.grpc.xds.internal.headermutations.HeaderMutationRulesConfig;
 import io.grpc.xds.internal.headermutations.HeaderMutationRulesParseException;
 import io.grpc.xds.internal.headermutations.HeaderMutationRulesParser;
-import io.grpc.xds.internal.headermutations.HeaderMutations;
-import io.grpc.xds.internal.headermutations.HeaderMutator;
-import io.grpc.xds.internal.headermutations.HeaderValueOption;
-import java.io.ByteArrayInputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
-import java.util.Queue;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 import javax.annotation.Nullable;
 
 /**
@@ -111,87 +56,6 @@ import javax.annotation.Nullable;
 public class ExternalProcessorFilter implements Filter {
   static final String TYPE_URL = 
       "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor";
-
-  enum ExtProcStreamState {
-    ACTIVE,
-    DRAINING,
-    COMPLETED,
-    FAILED
-  }
-
-  enum DataPlaneCallState {
-    IDLE,
-    ACTIVE,
-    CLOSED
-  }
-
-  @VisibleForTesting
-  static final DoubleHistogramMetricInstrument clientHeadersDuration;
-  @VisibleForTesting
-  static final DoubleHistogramMetricInstrument clientHalfCloseDuration;
-  @VisibleForTesting
-  static final DoubleHistogramMetricInstrument serverHeadersDuration;
-  @VisibleForTesting
-  static final DoubleHistogramMetricInstrument serverTrailersDuration;
-
-  // Copied from io.grpc.opentelemetry.internal.OpenTelemetryConstants.LATENCY_BUCKETS
-  private static final List<Double> LATENCY_BUCKETS = ImmutableList.of(
-      0d,     0.00001d, 0.00005d, 0.0001d, 0.0003d, 0.0006d, 0.0008d, 0.001d, 0.002d,
-      0.003d, 0.004d,   0.005d,   0.006d,  0.008d,  0.01d,   0.013d,  0.016d, 0.02d,
-      0.025d, 0.03d,    0.04d,    0.05d,   0.065d,  0.08d,   0.1d,    0.13d,  0.16d,
-      0.2d,   0.25d,    0.3d,     0.4d,    0.5d,    0.65d,   0.8d,    1d,     2d,
-      5d,     10d,      20d,      50d,     100d);
-
-  static {
-    if (GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_CLIENT", false)) {
-      MetricInstrumentRegistry registry = MetricInstrumentRegistry.getDefaultRegistry();
-
-      clientHeadersDuration = registry.registerDoubleHistogram(
-          "grpc.client_ext_proc.client_headers_duration",
-          "Time between when the ext_proc filter sees the client's headers and when "
-              + "it allows those headers to continue on to the next filter",
-          "s",
-          LATENCY_BUCKETS,
-          ImmutableList.of("grpc.target"),
-          ImmutableList.of("grpc.lb.backend_service"),
-          true);
-
-      clientHalfCloseDuration = registry.registerDoubleHistogram(
-          "grpc.client_ext_proc.client_half_close_duration",
-          "Time between when the ext_proc filter sees the client's half-close and when "
-              + "it allows that half-close to continue on to the next filter",
-          "s",
-          LATENCY_BUCKETS,
-          ImmutableList.of("grpc.target"),
-          ImmutableList.of("grpc.lb.backend_service"),
-          true);
-
-      serverHeadersDuration = registry.registerDoubleHistogram(
-          "grpc.client_ext_proc.server_headers_duration",
-          "Time between when the ext_proc filter sees the server's headers and when "
-              + "it allows those headers to continue on to the next filter",
-          "s",
-          LATENCY_BUCKETS,
-          ImmutableList.of("grpc.target"),
-          ImmutableList.of("grpc.lb.backend_service"),
-          true);
-
-      serverTrailersDuration = registry.registerDoubleHistogram(
-          "grpc.client_ext_proc.server_trailers_duration",
-          "Time between when the ext_proc filter sees the server's trailers and when "
-              + "it allows those trailers to continue on to the next filter",
-          "s",
-          LATENCY_BUCKETS,
-          ImmutableList.of("grpc.target"),
-          ImmutableList.of("grpc.lb.backend_service"),
-          true);
-    } else {
-      clientHeadersDuration = null;
-      clientHalfCloseDuration = null;
-      serverHeadersDuration = null;
-      serverTrailersDuration = null;
-    }
-  }
 
   private final CachedChannelManager cachedChannelManager;
   private final FilterContext context;
@@ -219,12 +83,7 @@ public class ExternalProcessorFilter implements Filter {
 
     @Override
     public boolean isClientFilter() {
-      return true;
-    }
-
-    @Override
-    public boolean isServerFilter() {
-      return true;
+      return GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_CLIENT", false);
     }
 
     @Override
@@ -270,27 +129,14 @@ public class ExternalProcessorFilter implements Filter {
   @Override
   public ClientInterceptor buildClientInterceptor(FilterConfig filterConfig,
       @Nullable FilterConfig overrideConfig, ScheduledExecutorService scheduler) {
-    return new ClientInterceptor() {
-      @Override
-      public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
-          MethodDescriptor<ReqT, RespT> method, CallOptions callOptions, Channel next) {
-        return next.newCall(method, callOptions);
-      }
-    };
-  }
-
-  @Nullable
-  @Override
-  public ServerInterceptor buildServerInterceptor(FilterConfig filterConfig,
-      @Nullable FilterConfig overrideConfig) {
     ExternalProcessorFilterConfig extProcFilterConfig =
         (ExternalProcessorFilterConfig) filterConfig;
     if (overrideConfig != null) {
       extProcFilterConfig = mergeConfigs(extProcFilterConfig,
           (ExternalProcessorFilterOverrideConfig) overrideConfig);
     }
-    return new ExternalProcessorServerInterceptor(
-        extProcFilterConfig, cachedChannelManager, context);
+    return new ExternalProcessorClientInterceptor(
+        extProcFilterConfig, cachedChannelManager, scheduler, context);
   }
 
   private static ExternalProcessorFilterConfig mergeConfigs(
@@ -346,10 +192,12 @@ public class ExternalProcessorFilter implements Filter {
       return ConfigOrError.fromError("Invalid response_body_mode: " + mode.getResponseBodyMode()
           + ". Only GRPC and NONE are supported.");
     }
+
     if (mode.getResponseBodyMode() == ProcessingMode.BodySendMode.GRPC
         && mode.getResponseTrailerMode() != ProcessingMode.HeaderSendMode.SEND) {
-      return ConfigOrError.fromError("Invalid response_trailer_mode: " + mode.getResponseTrailerMode()
-          + ". Trailer mode must be SEND if response body mode is GRPC.");
+      return ConfigOrError.fromError(
+          "Invalid response_trailer_mode: " + mode.getResponseTrailerMode()
+              + ". response_trailer_mode must be SEND if response_body_mode is GRPC.");
     }
 
     try {

@@ -739,10 +739,6 @@ final class XdsNameResolver extends NameResolver {
       Set<String> filtersToShutdown = new HashSet<>(activeFilters.keySet());
       for (NamedFilterConfig namedFilter : filterConfigs) {
         String typeUrl = namedFilter.filterConfig.typeUrl();
-        if (typeUrl.equals(ExternalProcessorFilter.TYPE_URL)
-            && !GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_CLIENT", false)) {
-          continue;
-        }
         String filterKey = namedFilter.filterStateKey();
 
         Filter.Provider provider = filterRegistry.get(typeUrl);
@@ -892,15 +888,7 @@ final class XdsNameResolver extends NameResolver {
       }
 
       ImmutableList.Builder<ClientInterceptor> filterInterceptors = ImmutableList.builder();
-      boolean hasExtProc = false;
       for (NamedFilterConfig namedFilter : filterConfigs) {
-        String typeUrl = namedFilter.filterConfig.typeUrl();
-        if (typeUrl.equals(ExternalProcessorFilter.TYPE_URL)) {
-          if (!GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_CLIENT", false)) {
-            continue;
-          }
-          hasExtProc = true;
-        }
         String name = namedFilter.name;
         FilterConfig config = namedFilter.filterConfig;
         FilterConfig overrideConfig = selectedOverrideConfigs.get(name);
@@ -916,16 +904,10 @@ final class XdsNameResolver extends NameResolver {
         }
       }
 
-      if (hasExtProc) {
-        ImmutableList.Builder<ClientInterceptor> withRawMessage = ImmutableList.builder();
-        withRawMessage.add(new RawMessageClientInterceptor());
-        withRawMessage.addAll(filterInterceptors.build());
-        return combineInterceptors(withRawMessage.build());
-      }
-
-      // Combine interceptors produced by different filters into a single one that executes
-      // them sequentially. The order is preserved.
-      return combineInterceptors(filterInterceptors.build());
+      ImmutableList.Builder<ClientInterceptor> withRawMessage = ImmutableList.builder();
+      withRawMessage.add(new RawMessageClientInterceptor());
+      withRawMessage.addAll(filterInterceptors.build());
+      return combineInterceptors(withRawMessage.build());
     }
 
     private void cleanUpRoutes(Status error) {

@@ -56,5 +56,16 @@ public class HeaderValueTest {
     assertThat(headerValue.isValid()).isFalse();
   }
 
+  @Test(expected = IllegalArgumentException.class)
+  public void create_emptyKey_throws() {
+    HeaderValue.create("", "value");
+  }
+
+  @Test(expected = IllegalArgumentException.class)
+  public void create_tooLongValue_throws() {
+    String longVal = new String(new char[16385]).replace('\0', 'v');
+    HeaderValue.create("key", longVal);
+  }
+
 
 }
