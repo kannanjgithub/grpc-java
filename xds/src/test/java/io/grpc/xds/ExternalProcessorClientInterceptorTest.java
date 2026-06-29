@@ -12517,25 +12517,25 @@ public class ExternalProcessorClientInterceptorTest {
 
     // Verify that the 4 duration metrics were recorded with proper labels!
     Mockito.verify(mockMetricRecorder, Mockito.times(1)).recordDoubleHistogram(
-        Mockito.eq(ExternalProcessorClientInterceptor.clientHeadersDuration),
+        Mockito.eq(ExternalProcessorFilter.clientHeadersDuration),
         Mockito.anyDouble(),
         Mockito.eq(com.google.common.collect.ImmutableList.of("xds:///target-service-metric")),
         Mockito.eq(com.google.common.collect.ImmutableList.of("backend-service-metric")));
 
     Mockito.verify(mockMetricRecorder, Mockito.times(1)).recordDoubleHistogram(
-        Mockito.eq(ExternalProcessorClientInterceptor.clientHalfCloseDuration),
+        Mockito.eq(ExternalProcessorFilter.clientHalfCloseDuration),
         Mockito.anyDouble(),
         Mockito.eq(com.google.common.collect.ImmutableList.of("xds:///target-service-metric")),
         Mockito.eq(com.google.common.collect.ImmutableList.of("backend-service-metric")));
 
     Mockito.verify(mockMetricRecorder, Mockito.times(1)).recordDoubleHistogram(
-        Mockito.eq(ExternalProcessorClientInterceptor.serverHeadersDuration),
+        Mockito.eq(ExternalProcessorFilter.serverHeadersDuration),
         Mockito.anyDouble(),
         Mockito.eq(com.google.common.collect.ImmutableList.of("xds:///target-service-metric")),
         Mockito.eq(com.google.common.collect.ImmutableList.of("backend-service-metric")));
 
     Mockito.verify(mockMetricRecorder, Mockito.times(1)).recordDoubleHistogram(
-        Mockito.eq(ExternalProcessorClientInterceptor.serverTrailersDuration),
+        Mockito.eq(ExternalProcessorFilter.serverTrailersDuration),
         Mockito.anyDouble(),
         Mockito.eq(com.google.common.collect.ImmutableList.of("xds:///target-service-metric")),
         Mockito.eq(com.google.common.collect.ImmutableList.of("backend-service-metric")));
@@ -12687,25 +12687,25 @@ public class ExternalProcessorClientInterceptorTest {
 
     // Verify that the 4 duration metrics were recorded with proper labels!
     Mockito.verify(mockMetricRecorder, Mockito.times(1)).recordDoubleHistogram(
-        Mockito.eq(ExternalProcessorClientInterceptor.clientHeadersDuration),
+        Mockito.eq(ExternalProcessorFilter.clientHeadersDuration),
         Mockito.anyDouble(),
         Mockito.eq(com.google.common.collect.ImmutableList.of("xds:///target-service-metric-fail")),
         Mockito.eq(com.google.common.collect.ImmutableList.of("backend-service-metric-fail")));
 
     Mockito.verify(mockMetricRecorder, Mockito.times(1)).recordDoubleHistogram(
-        Mockito.eq(ExternalProcessorClientInterceptor.clientHalfCloseDuration),
+        Mockito.eq(ExternalProcessorFilter.clientHalfCloseDuration),
         Mockito.anyDouble(),
         Mockito.eq(com.google.common.collect.ImmutableList.of("xds:///target-service-metric-fail")),
         Mockito.eq(com.google.common.collect.ImmutableList.of("backend-service-metric-fail")));
 
     Mockito.verify(mockMetricRecorder, Mockito.times(1)).recordDoubleHistogram(
-        Mockito.eq(ExternalProcessorClientInterceptor.serverHeadersDuration),
+        Mockito.eq(ExternalProcessorFilter.serverHeadersDuration),
         Mockito.anyDouble(),
         Mockito.eq(com.google.common.collect.ImmutableList.of("xds:///target-service-metric-fail")),
         Mockito.eq(com.google.common.collect.ImmutableList.of("backend-service-metric-fail")));
 
     Mockito.verify(mockMetricRecorder, Mockito.times(1)).recordDoubleHistogram(
-        Mockito.eq(ExternalProcessorClientInterceptor.serverTrailersDuration),
+        Mockito.eq(ExternalProcessorFilter.serverTrailersDuration),
         Mockito.anyDouble(),
         Mockito.eq(com.google.common.collect.ImmutableList.of("xds:///target-service-metric-fail")),
         Mockito.eq(com.google.common.collect.ImmutableList.of("backend-service-metric-fail")));

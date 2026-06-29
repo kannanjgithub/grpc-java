@@ -21,6 +21,7 @@ import static com.google.common.base.Preconditions.checkNotNull;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.protobuf.Any;
+import com.google.protobuf.ByteString;
 import com.google.protobuf.Duration;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Message;
@@ -32,6 +33,10 @@ import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
 import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.HeaderForwardingRules;
 import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ProcessingMode;
 import io.grpc.ClientInterceptor;
+import io.grpc.DoubleHistogramMetricInstrument;
+import io.grpc.Drainable;
+import io.grpc.MetricInstrumentRegistry;
+import io.grpc.ServerInterceptor;
 import io.grpc.internal.GrpcUtil;
 import io.grpc.xds.Filter.FilterConfigParseContext;
 import io.grpc.xds.Filter.FilterContext;
@@ -43,6 +48,8 @@ import io.grpc.xds.internal.grpcservice.GrpcServiceParseException;
 import io.grpc.xds.internal.headermutations.HeaderMutationRulesConfig;
 import io.grpc.xds.internal.headermutations.HeaderMutationRulesParseException;
 import io.grpc.xds.internal.headermutations.HeaderMutationRulesParser;
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
@@ -56,6 +63,102 @@ import javax.annotation.Nullable;
 public class ExternalProcessorFilter implements Filter {
   static final String TYPE_URL = 
       "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor";
+
+  @VisibleForTesting
+  static DoubleHistogramMetricInstrument clientHeadersDuration;
+  @VisibleForTesting
+  static DoubleHistogramMetricInstrument clientHalfCloseDuration;
+  @VisibleForTesting
+  static DoubleHistogramMetricInstrument serverHeadersDuration;
+  @VisibleForTesting
+  static DoubleHistogramMetricInstrument serverTrailersDuration;
+
+  // Copied from io.grpc.opentelemetry.internal.OpenTelemetryConstants.LATENCY_BUCKETS
+  private static final List<Double> LATENCY_BUCKETS = ImmutableList.of(
+      0d,     0.00001d, 0.00005d, 0.0001d, 0.0003d, 0.0006d, 0.0008d, 0.001d, 0.002d,
+      0.003d, 0.004d,   0.005d,   0.006d,  0.008d,  0.01d,   0.013d,  0.016d, 0.02d,
+      0.025d, 0.03d,    0.04d,    0.05d,   0.065d,  0.08d,   0.1d,    0.13d,  0.16d,
+      0.2d,   0.25d,    0.3d,     0.4d,    0.5d,    0.65d,   0.8d,    1d,     2d,
+      5d,     10d,      20d,      50d,     100d);
+
+  static {
+    if (GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_CLIENT", false)
+        || GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_SERVER", false)) {
+      initMetricInstruments();
+    }
+  }
+
+  static synchronized void initMetricInstruments() {
+    if (clientHeadersDuration == null && (GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_CLIENT", false)
+        || GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_SERVER", false))) {
+      MetricInstrumentRegistry registry = MetricInstrumentRegistry.getDefaultRegistry();
+
+      clientHeadersDuration = registry.registerDoubleHistogram(
+          "grpc.client_ext_proc.client_headers_duration",
+          "Time between when the ext_proc filter sees the client's headers and when "
+              + "it allows those headers to continue on to the next filter",
+          "s",
+          LATENCY_BUCKETS,
+          ImmutableList.of("grpc.target"),
+          ImmutableList.of("grpc.lb.backend_service"),
+          true);
+
+      clientHalfCloseDuration = registry.registerDoubleHistogram(
+          "grpc.client_ext_proc.client_half_close_duration",
+          "Time between when the ext_proc filter sees the client's half-close and when "
+              + "it allows that half-close to continue on to the next filter",
+          "s",
+          LATENCY_BUCKETS,
+          ImmutableList.of("grpc.target"),
+          ImmutableList.of("grpc.lb.backend_service"),
+          true);
+
+      serverHeadersDuration = registry.registerDoubleHistogram(
+          "grpc.client_ext_proc.server_headers_duration",
+          "Time between when the ext_proc filter sees the server's headers and when "
+              + "it allows those headers to continue on to the next filter",
+          "s",
+          LATENCY_BUCKETS,
+          ImmutableList.of("grpc.target"),
+          ImmutableList.of("grpc.lb.backend_service"),
+          true);
+
+      serverTrailersDuration = registry.registerDoubleHistogram(
+          "grpc.client_ext_proc.server_trailers_duration",
+          "Time between when the ext_proc filter sees the server's trailers and when "
+              + "it allows those trailers to continue on to the next filter",
+          "s",
+          LATENCY_BUCKETS,
+          ImmutableList.of("grpc.target"),
+          ImmutableList.of("grpc.lb.backend_service"),
+          true);
+    }
+  }
+
+  enum ExtProcStreamState {
+    ACTIVE,
+    DRAINING,
+    COMPLETED,
+    FAILED;
+
+    boolean isCompleted() {
+      return this == COMPLETED || this == FAILED;
+    }
+
+    boolean isFailed() {
+      return this == FAILED;
+    }
+
+    boolean isDraining() {
+      return this == DRAINING;
+    }
+  }
+
+  enum DataPlaneCallState {
+    IDLE,
+    ACTIVE,
+    CLOSED
+  }
 
   private final CachedChannelManager cachedChannelManager;
   private final FilterContext context;
@@ -84,6 +187,11 @@ public class ExternalProcessorFilter implements Filter {
     @Override
     public boolean isClientFilter() {
       return GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_CLIENT", false);
+    }
+
+    @Override
+    public boolean isServerFilter() {
+      return GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_SERVER", false);
     }
 
     @Override
@@ -137,6 +245,20 @@ public class ExternalProcessorFilter implements Filter {
     }
     return new ExternalProcessorClientInterceptor(
         extProcFilterConfig, cachedChannelManager, scheduler, context);
+  }
+
+  @Nullable
+  @Override
+  public ServerInterceptor buildServerInterceptor(FilterConfig filterConfig,
+      @Nullable FilterConfig overrideConfig) {
+    ExternalProcessorFilterConfig extProcFilterConfig =
+        (ExternalProcessorFilterConfig) filterConfig;
+    if (overrideConfig != null) {
+      extProcFilterConfig = mergeConfigs(extProcFilterConfig,
+          (ExternalProcessorFilterOverrideConfig) overrideConfig);
+    }
+    return new ExternalProcessorServerInterceptor(
+        extProcFilterConfig, cachedChannelManager, context);
   }
 
   private static ExternalProcessorFilterConfig mergeConfigs(
@@ -443,5 +565,16 @@ public class ExternalProcessorFilter implements Filter {
       }
       return true;
     }
+  }
+
+  static ByteString outboundStreamToByteString(InputStream message) throws IOException {
+    if (message instanceof Drainable) {
+      int size = message.available();
+      ByteString.Output output =
+          size > 0 ? ByteString.newOutput(size) : ByteString.newOutput();
+      ((Drainable) message).drainTo(output);
+      return output.toByteString();
+    }
+    return ByteString.readFrom(message);
   }
 }

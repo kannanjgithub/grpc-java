@@ -9962,7 +9962,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   @Test
-  public void deserialization_binaryHeader_invalidBase64_ignored() throws Exception {
+  public void deserialization_binaryHeader_invalidBase64_noError_fails() throws Exception {
     ExternalProcessor proto = createBaseProto(extProcServerName).build();
     ConfigOrError<ExternalProcessorFilterConfig> configOrError =
         provider.parseFilterConfig(Any.pack(proto), filterContext);
@@ -10029,15 +10029,12 @@ public class ExternalProcessorServerInterceptorTest {
     io.grpc.ClientCall<InputStream, InputStream> clientCall = dataPlaneChannel.newCall(
         METHOD_SAY_HELLO_RAW, io.grpc.CallOptions.DEFAULT);
 
-    final AtomicReference<Metadata> receivedResponseHeaders = new AtomicReference<>();
+    final AtomicReference<Status> callStatus = new AtomicReference<>();
     final CountDownLatch callCompletedLatch = new CountDownLatch(1);
     clientCall.start(new io.grpc.ClientCall.Listener<InputStream>() {
       @Override
-      public void onHeaders(Metadata headers) {
-        receivedResponseHeaders.set(headers);
-      }
-      @Override
       public void onClose(Status status, Metadata trailers) {
+        callStatus.set(status);
         callCompletedLatch.countDown();
       }
     }, new Metadata());
@@ -10048,9 +10045,9 @@ public class ExternalProcessorServerInterceptorTest {
 
     assertThat(extProcLatch.await(5, TimeUnit.SECONDS)).isTrue();
     assertThat(callCompletedLatch.await(5, TimeUnit.SECONDS)).isTrue();
-    assertThat(receivedResponseHeaders.get()).isNotNull();
-    assertThat(receivedResponseHeaders.get().containsKey(Metadata.Key.of("custom-bin", Metadata.BINARY_BYTE_MARSHALLER)))
-        .isFalse();
+    assertThat(callStatus.get()).isNotNull();
+    assertThat(callStatus.get().getCode()).isEqualTo(Status.Code.INTERNAL);
+    assertThat(callStatus.get().getDescription()).contains("External processor stream failed");
   }
 
   @Test
@@ -10147,7 +10144,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   @Test
-  public void deserialization_asciiHeader_invalidCharacters_ignored() throws Exception {
+  public void deserialization_asciiHeader_invalidChars_noError_fails() throws Exception {
     ExternalProcessor proto = createBaseProto(extProcServerName).build();
     ConfigOrError<ExternalProcessorFilterConfig> configOrError =
         provider.parseFilterConfig(Any.pack(proto), filterContext);
@@ -10214,15 +10211,12 @@ public class ExternalProcessorServerInterceptorTest {
     io.grpc.ClientCall<InputStream, InputStream> clientCall = dataPlaneChannel.newCall(
         METHOD_SAY_HELLO_RAW, io.grpc.CallOptions.DEFAULT);
 
-    final AtomicReference<Metadata> receivedResponseHeaders = new AtomicReference<>();
+    final AtomicReference<Status> callStatus = new AtomicReference<>();
     final CountDownLatch callCompletedLatch = new CountDownLatch(1);
     clientCall.start(new io.grpc.ClientCall.Listener<InputStream>() {
       @Override
-      public void onHeaders(Metadata headers) {
-        receivedResponseHeaders.set(headers);
-      }
-      @Override
       public void onClose(Status status, Metadata trailers) {
+        callStatus.set(status);
         callCompletedLatch.countDown();
       }
     }, new Metadata());
@@ -10233,9 +10227,9 @@ public class ExternalProcessorServerInterceptorTest {
 
     assertThat(extProcLatch.await(5, TimeUnit.SECONDS)).isTrue();
     assertThat(callCompletedLatch.await(5, TimeUnit.SECONDS)).isTrue();
-    assertThat(receivedResponseHeaders.get()).isNotNull();
-    assertThat(receivedResponseHeaders.get().containsKey(Metadata.Key.of("custom-ascii", Metadata.ASCII_STRING_MARSHALLER)))
-        .isFalse();
+    assertThat(callStatus.get()).isNotNull();
+    assertThat(callStatus.get().getCode()).isEqualTo(Status.Code.INTERNAL);
+    assertThat(callStatus.get().getDescription()).contains("External processor stream failed");
   }
 
   @Test
@@ -10332,7 +10326,7 @@ public class ExternalProcessorServerInterceptorTest {
   }
 
   @Test
-  public void deserialization_headerValue_tooLong_ignored() throws Exception {
+  public void deserialization_headerValue_tooLong_noError_fails() throws Exception {
     ExternalProcessor proto = createBaseProto(extProcServerName).build();
     ConfigOrError<ExternalProcessorFilterConfig> configOrError =
         provider.parseFilterConfig(Any.pack(proto), filterContext);
@@ -10400,15 +10394,12 @@ public class ExternalProcessorServerInterceptorTest {
     io.grpc.ClientCall<InputStream, InputStream> clientCall = dataPlaneChannel.newCall(
         METHOD_SAY_HELLO_RAW, io.grpc.CallOptions.DEFAULT);
 
-    final AtomicReference<Metadata> receivedResponseHeaders = new AtomicReference<>();
+    final AtomicReference<Status> callStatus = new AtomicReference<>();
     final CountDownLatch callCompletedLatch = new CountDownLatch(1);
     clientCall.start(new io.grpc.ClientCall.Listener<InputStream>() {
       @Override
-      public void onHeaders(Metadata headers) {
-        receivedResponseHeaders.set(headers);
-      }
-      @Override
       public void onClose(Status status, Metadata trailers) {
+        callStatus.set(status);
         callCompletedLatch.countDown();
       }
     }, new Metadata());
@@ -10419,9 +10410,9 @@ public class ExternalProcessorServerInterceptorTest {
 
     assertThat(extProcLatch.await(5, TimeUnit.SECONDS)).isTrue();
     assertThat(callCompletedLatch.await(5, TimeUnit.SECONDS)).isTrue();
-    assertThat(receivedResponseHeaders.get()).isNotNull();
-    assertThat(receivedResponseHeaders.get().containsKey(Metadata.Key.of("custom-ascii", Metadata.ASCII_STRING_MARSHALLER)))
-        .isFalse();
+    assertThat(callStatus.get()).isNotNull();
+    assertThat(callStatus.get().getCode()).isEqualTo(Status.Code.INTERNAL);
+    assertThat(callStatus.get().getDescription()).contains("External processor stream failed");
   }
 
   @Test

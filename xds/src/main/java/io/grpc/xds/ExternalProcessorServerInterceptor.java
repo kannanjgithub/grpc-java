@@ -19,6 +19,7 @@ package io.grpc.xds;
 import static com.google.common.base.Preconditions.checkNotNull;
 import static io.grpc.xds.ExternalProcessorFilter.clientHalfCloseDuration;
 import static io.grpc.xds.ExternalProcessorFilter.clientHeadersDuration;
+import static io.grpc.xds.ExternalProcessorFilter.outboundStreamToByteString;
 import static io.grpc.xds.ExternalProcessorFilter.serverHeadersDuration;
 import static io.grpc.xds.ExternalProcessorFilter.serverTrailersDuration;
 
@@ -71,6 +72,7 @@ import io.grpc.xds.ExternalProcessorFilter.ExtProcStreamState;
 import io.grpc.xds.ExternalProcessorFilter.ExternalProcessorFilterConfig;
 import io.grpc.xds.ExternalProcessorFilter.HeaderForwardingRulesConfig;
 import io.grpc.xds.Filter.FilterContext;
+import io.grpc.xds.internal.KnownLengthInputStream;
 import io.grpc.xds.internal.grpcservice.CachedChannelManager;
 import io.grpc.xds.internal.grpcservice.HeaderValue;
 import io.grpc.xds.internal.grpcservice.HeaderValueValidationUtils;
@@ -112,6 +114,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     this.filterConfig = checkNotNull(filterConfig, "filterConfig");
     checkNotNull(cachedChannelManager, "cachedChannelManager");
     this.metricsRecorder = checkNotNull(context.metricsRecorder(), "metricsRecorder");
+    ExternalProcessorFilter.initMetricInstruments();
     this.extProcChannel = cachedChannelManager.getChannel(filterConfig.getGrpcServiceConfig());
   }
 
@@ -530,7 +533,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       for (io.envoyproxy.envoy.config.core.v3.HeaderValueOption protoOption
           : mutation.getSetHeadersList()) {
         io.envoyproxy.envoy.config.core.v3.HeaderValue protoHeader = protoOption.getHeader();
-        HeaderValue headerValue;
+        String key = protoHeader.getKey();
+        HeaderValueValidationUtils.validateHeaderKey(key);
 
         ByteString rawBytes = protoHeader.getRawValue();
         if (rawBytes.isEmpty()) {
@@ -538,28 +542,31 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
         }
 
         if (rawBytes.size() > HeaderValueValidationUtils.MAX_HEADER_LENGTH) {
-          headerValue = HeaderValue.createInvalid(protoHeader.getKey());
-        } else if (protoHeader.getKey().endsWith(Metadata.BINARY_HEADER_SUFFIX)) {
-          try {
-            byte[] decodedBytes = BaseEncoding.base64().decode(rawBytes.toStringUtf8());
-            headerValue = HeaderValue.create(
-                protoHeader.getKey(), ByteString.copyFrom(decodedBytes));
-          } catch (IllegalArgumentException e) {
-            // Mark as invalid so HeaderMutationFilter can either silently ignore it or
-            // throw an exception based on the disallow_is_error configuration.
-            headerValue = HeaderValue.createInvalid(protoHeader.getKey());
-          }
+          throw new IllegalArgumentException(
+              "Header value length exceeds maximum allowed length: " + rawBytes.size());
+        }
+
+        HeaderValue headerValue;
+        if (key.endsWith(Metadata.BINARY_HEADER_SUFFIX)) {
+          byte[] decodedBytes = BaseEncoding.base64().decode(rawBytes.toStringUtf8());
+          headerValue = HeaderValue.create(key, ByteString.copyFrom(decodedBytes));
         } else {
-          headerValue = HeaderValue.create(protoHeader.getKey(), rawBytes.toStringUtf8());
+          headerValue = HeaderValue.create(key, rawBytes.toStringUtf8());
         }
         headersToModify.add(HeaderValueOption.create(
             headerValue,
             HeaderValueOption.HeaderAppendAction.valueOf(protoOption.getAppendAction().name())));
       }
 
+      ImmutableList.Builder<String> headersToRemove = ImmutableList.builder();
+      for (String headerToRemove : mutation.getRemoveHeadersList()) {
+        HeaderValueValidationUtils.validateHeaderKey(headerToRemove);
+        headersToRemove.add(headerToRemove);
+      }
+
       HeaderMutations mutations = HeaderMutations.create(
           headersToModify.build(),
-          ImmutableList.copyOf(mutation.getRemoveHeadersList()));
+          headersToRemove.build());
 
       HeaderMutations filteredMutations = mutationFilter.filter(mutations);
       mutator.applyMutations(filteredMutations, metadata);
@@ -1496,46 +1503,6 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
           dataPlaneServerCall.callContext.run(del::onComplete);
         }
       });
-    }
-  }
-
-  private static ByteString outboundStreamToByteString(InputStream message) throws IOException {
-    if (message instanceof Drainable) {
-      int size = message.available();
-      ByteString.Output output =
-          size > 0 ? ByteString.newOutput(size) : ByteString.newOutput();
-      ((Drainable) message).drainTo(output);
-      return output.toByteString();
-    }
-    return ByteString.readFrom(message);
-  }
-
-  private static final class KnownLengthInputStream extends InputStream
-      implements KnownLength {
-    private final InputStream delegate;
-
-    KnownLengthInputStream(ByteString byteString) {
-      this.delegate = byteString.newInput();
-    }
-
-    @Override
-    public int read() throws IOException {
-      return delegate.read();
-    }
-
-    @Override
-    public int read(byte[] b, int off, int len) throws IOException {
-      return delegate.read(b, off, len);
-    }
-
-    @Override
-    public int available() throws IOException {
-      return delegate.available();
-    }
-
-    @Override
-    public void close() throws IOException {
-      delegate.close();
     }
   }
 }
