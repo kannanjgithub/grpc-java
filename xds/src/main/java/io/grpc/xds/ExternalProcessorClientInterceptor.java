@@ -17,7 +17,6 @@
 package io.grpc.xds;
 
 import static com.google.common.base.Preconditions.checkNotNull;
-import static io.grpc.xds.ExternalProcessorHeaderUtil.toHeaderMap;
 import static io.grpc.xds.internal.extproc.ExternalProcessorClientInterceptorMetricInstruments.clientHalfCloseDuration;
 import static io.grpc.xds.internal.extproc.ExternalProcessorClientInterceptorMetricInstruments.clientHeadersDuration;
 import static io.grpc.xds.internal.extproc.ExternalProcessorClientInterceptorMetricInstruments.serverHeadersDuration;
@@ -27,6 +26,7 @@ import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.markDataPlaneCa
 import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.markExtProcStreamCompleted;
 import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.markExtProcStreamFailed;
 import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.outboundStreamToByteString;
+import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.toHeaderMap;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
