@@ -18,10 +18,10 @@ package io.grpc.xds;
 
 import static com.google.common.base.Preconditions.checkNotNull;
 import static io.grpc.xds.ExternalProcessorHeaderUtil.toHeaderMap;
-import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.clientHalfCloseDuration;
-import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.clientHeadersDuration;
-import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.serverHeadersDuration;
-import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.serverTrailersDuration;
+import static io.grpc.xds.internal.extproc.ExternalProcessorServerInterceptorMetricInstruments.clientHalfCloseDuration;
+import static io.grpc.xds.internal.extproc.ExternalProcessorServerInterceptorMetricInstruments.clientHeadersDuration;
+import static io.grpc.xds.internal.extproc.ExternalProcessorServerInterceptorMetricInstruments.serverHeadersDuration;
+import static io.grpc.xds.internal.extproc.ExternalProcessorServerInterceptorMetricInstruments.serverTrailersDuration;
 import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.collectAttributes;
 import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.markDataPlaneCallClosed;
 import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.markExtProcStreamCompleted;
@@ -71,7 +71,7 @@ import io.grpc.xds.Filter.FilterContext;
 import io.grpc.xds.internal.extproc.DataPlaneCallState;
 import io.grpc.xds.internal.extproc.EventType;
 import io.grpc.xds.internal.extproc.ExtProcStreamState;
-import io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments;
+import io.grpc.xds.internal.extproc.ExternalProcessorServerInterceptorMetricInstruments;
 import io.grpc.xds.internal.extproc.KnownLengthInputStream;
 import io.grpc.xds.internal.grpcservice.CachedChannelManager;
 import io.grpc.xds.internal.grpcservice.HeaderValue;
@@ -114,7 +114,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     this.filterConfig = checkNotNull(filterConfig, "filterConfig");
     checkNotNull(cachedChannelManager, "cachedChannelManager");
     this.metricsRecorder = checkNotNull(context.metricsRecorder(), "metricsRecorder");
-    ExternalProcessorMetricInstruments.initMetricInstruments();
+    ExternalProcessorServerInterceptorMetricInstruments.initMetricInstruments();
     this.extProcChannel = cachedChannelManager.getChannel(filterConfig.getGrpcServiceConfig());
   }
 
