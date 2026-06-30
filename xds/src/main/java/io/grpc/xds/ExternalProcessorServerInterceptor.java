@@ -17,6 +17,7 @@
 package io.grpc.xds;
 
 import static com.google.common.base.Preconditions.checkNotNull;
+import static io.grpc.xds.ExternalProcessorUtil.collectAttributes;
 import static io.grpc.xds.ExternalProcessorUtil.outboundStreamToByteString;
 import static io.grpc.xds.ExternalProcessorUtil.toHeaderMap;
 import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.clientHalfCloseDuration;
@@ -24,16 +25,12 @@ import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.cl
 import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.serverHeadersDuration;
 import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.serverTrailersDuration;
 
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Joiner;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.io.BaseEncoding;
 import com.google.common.util.concurrent.MoreExecutors;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Struct;
-import com.google.protobuf.Value;
-import io.envoyproxy.envoy.config.core.v3.HeaderMap;
 import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ProcessingMode;
 import io.envoyproxy.envoy.service.ext_proc.v3.BodyMutation;
 import io.envoyproxy.envoy.service.ext_proc.v3.BodyResponse;
@@ -50,9 +47,7 @@ import io.envoyproxy.envoy.service.ext_proc.v3.ProtocolConfiguration;
 import io.envoyproxy.envoy.service.ext_proc.v3.StreamedBodyResponse;
 import io.grpc.Context;
 import io.grpc.DoubleHistogramMetricInstrument;
-import io.grpc.Drainable;
 import io.grpc.ForwardingServerCall.SimpleForwardingServerCall;
-import io.grpc.KnownLength;
 import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
@@ -71,7 +66,6 @@ import io.grpc.stub.MetadataUtils;
 import io.grpc.xds.ExternalProcessorFilter.DataPlaneCallState;
 import io.grpc.xds.ExternalProcessorFilter.ExtProcStreamState;
 import io.grpc.xds.ExternalProcessorFilter.ExternalProcessorFilterConfig;
-import io.grpc.xds.ExternalProcessorFilter.HeaderForwardingRulesConfig;
 import io.grpc.xds.Filter.FilterContext;
 import io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments;
 import io.grpc.xds.internal.extproc.KnownLengthInputStream;
@@ -86,9 +80,6 @@ import io.grpc.xds.internal.headermutations.HeaderMutator;
 import io.grpc.xds.internal.headermutations.HeaderValueOption;
 import java.io.IOException;
 import java.io.InputStream;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Locale;
 import java.util.Optional;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -179,94 +170,6 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     return (ServerCall.Listener<ReqT>) dataPlaneServerCall.getListener();
   }
 
-  private static ImmutableMap<String, Struct> collectAttributes(
-      ImmutableList<String> requestedAttributes,
-      MethodDescriptor<?, ?> method,
-      String authority,
-      Metadata headers) {
-    if (requestedAttributes.isEmpty()) {
-      return ImmutableMap.of();
-    }
-    ImmutableMap.Builder<String, Struct> attributes = ImmutableMap.builder();
-    for (String attr : requestedAttributes) {
-      switch (attr) {
-        case "request.path":
-        case "request.url_path":
-          attributes.put(attr, encodeAttribute("/" + method.getFullMethodName()));
-          break;
-        case "request.host":
-          attributes.put(attr, encodeAttribute(authority));
-          break;
-        case "request.method":
-          attributes.put(attr, encodeAttribute("POST"));
-          break;
-        case "request.headers":
-          attributes.put(attr, encodeHeaders(headers));
-          break;
-        case "request.referer":
-          String referer = getHeaderValue(headers, "referer");
-          if (referer != null) {
-            attributes.put(attr, encodeAttribute(referer));
-          }
-          break;
-        case "request.useragent":
-          String ua = getHeaderValue(headers, "user-agent");
-          if (ua != null) {
-            attributes.put(attr, encodeAttribute(ua));
-          }
-          break;
-        case "request.id":
-          String id = getHeaderValue(headers, "x-request-id");
-          if (id != null) {
-            attributes.put(attr, encodeAttribute(id));
-          }
-          break;
-        case "request.query":
-          attributes.put(attr, encodeAttribute(""));
-          break;
-        default:
-          break;
-      }
-    }
-    return attributes.buildOrThrow();
-  }
-
-  private static Struct encodeAttribute(String value) {
-    return Struct.newBuilder()
-        .putFields("", Value.newBuilder().setStringValue(value).build())
-        .build();
-  }
-
-  private static Struct encodeHeaders(Metadata headers) {
-    Struct.Builder builder = Struct.newBuilder();
-    for (String key : headers.keys()) {
-      String value = getHeaderValue(headers, key);
-      if (value != null) {
-        builder.putFields(key.toLowerCase(Locale.ROOT),
-            Value.newBuilder().setStringValue(value).build());
-      }
-    }
-    return builder.build();
-  }
-
-  @Nullable
-  private static String getHeaderValue(Metadata headers, String headerName) {
-    if (headerName.endsWith(Metadata.BINARY_HEADER_SUFFIX)) {
-      Metadata.Key<byte[]> key = Metadata.Key.of(headerName, Metadata.BINARY_BYTE_MARSHALLER);
-      Iterable<byte[]> values = headers.getAll(key);
-      if (values == null) {
-        return null;
-      }
-      List<String> encoded = new ArrayList<>();
-      for (byte[] v : values) {
-        encoded.add(BaseEncoding.base64().omitPadding().encode(v));
-      }
-      return Joiner.on(",").join(encoded);
-    }
-    Metadata.Key<String> key = Metadata.Key.of(headerName, Metadata.ASCII_STRING_MARSHALLER);
-    Iterable<String> values = headers.getAll(key);
-    return values == null ? null : Joiner.on(",").join(values);
-  }
 
   private static class DataPlaneServerCall extends SimpleForwardingServerCall<InputStream, InputStream> {
     private enum EventType {
