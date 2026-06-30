@@ -60,30 +60,7 @@ public class ExternalProcessorFilter implements Filter {
     ExternalProcessorMetricInstruments.initMetricInstruments();
   }
 
-  enum ExtProcStreamState {
-    ACTIVE,
-    DRAINING,
-    COMPLETED,
-    FAILED;
 
-    boolean isCompleted() {
-      return this == COMPLETED || this == FAILED;
-    }
-
-    boolean isFailed() {
-      return this == FAILED;
-    }
-
-    boolean isDraining() {
-      return this == DRAINING;
-    }
-  }
-
-  enum DataPlaneCallState {
-    IDLE,
-    ACTIVE,
-    CLOSED
-  }
 
   private final CachedChannelManager cachedChannelManager;
   private final FilterContext context;

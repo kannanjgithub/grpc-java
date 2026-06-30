@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package io.grpc.xds;
+package io.grpc.xds.internal.extproc;
 
 import com.google.common.base.Joiner;
 import com.google.common.collect.ImmutableList;
@@ -23,23 +23,27 @@ import com.google.common.io.BaseEncoding;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Struct;
 import com.google.protobuf.Value;
-import io.envoyproxy.envoy.config.core.v3.HeaderMap;
 import io.grpc.Drainable;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
-import io.grpc.xds.ExternalProcessorFilter.HeaderForwardingRulesConfig;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
-import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
 import javax.annotation.Nullable;
 
-final class ExternalProcessorUtil {
+/**
+ * Utility methods for external processing.
+ */
+public final class ExternalProcessorUtil {
   private ExternalProcessorUtil() {}
 
-  static ByteString outboundStreamToByteString(InputStream message) throws IOException {
+  /**
+   * Reads an InputStream into a ByteString.
+   */
+  public static ByteString outboundStreamToByteString(InputStream message) throws IOException {
     if (message instanceof Drainable) {
       int size = message.available();
       ByteString.Output output =
@@ -50,48 +54,10 @@ final class ExternalProcessorUtil {
     return ByteString.readFrom(message);
   }
 
-  static HeaderMap toHeaderMap(
-      Metadata metadata, Optional<HeaderForwardingRulesConfig> forwardRules) {
-    HeaderMap.Builder builder = HeaderMap.newBuilder();
-
-    for (String key : metadata.keys()) {
-      if (forwardRules.isPresent() && !forwardRules.get().isAllowed(key)) {
-        continue;
-      }
-      // Map binary headers using raw_value
-      if (key.endsWith(Metadata.BINARY_HEADER_SUFFIX)) {
-        Metadata.Key<byte[]> binKey = Metadata.Key.of(key, Metadata.BINARY_BYTE_MARSHALLER);
-        Iterable<byte[]> values = metadata.getAll(binKey);
-        if (values != null) {
-          for (byte[] binValue : values) {
-            String base64Value = BaseEncoding.base64().encode(binValue);
-            io.envoyproxy.envoy.config.core.v3.HeaderValue headerValue =
-                io.envoyproxy.envoy.config.core.v3.HeaderValue.newBuilder()
-                    .setKey(key.toLowerCase(Locale.ROOT))
-                    .setRawValue(ByteString.copyFromUtf8(base64Value))
-                    .build();
-            builder.addHeaders(headerValue);
-          }
-        }
-      } else {
-        Metadata.Key<String> asciiKey = Metadata.Key.of(key, Metadata.ASCII_STRING_MARSHALLER);
-        Iterable<String> values = metadata.getAll(asciiKey);
-        if (values != null) {
-          for (String value : values) {
-            io.envoyproxy.envoy.config.core.v3.HeaderValue headerValue =
-                io.envoyproxy.envoy.config.core.v3.HeaderValue.newBuilder()
-                    .setKey(key.toLowerCase(Locale.ROOT))
-                    .setRawValue(ByteString.copyFromUtf8(value))
-                    .build();
-            builder.addHeaders(headerValue);
-          }
-        }
-      }
-    }
-    return builder.build();
-  }
-
-  static ImmutableMap<String, Struct> collectAttributes(
+  /**
+   * Collects request attributes and structures them as Struct map.
+   */
+  public static ImmutableMap<String, Struct> collectAttributes(
       ImmutableList<String> requestedAttributes,
       MethodDescriptor<?, ?> method,
       String authority,
@@ -144,13 +110,19 @@ final class ExternalProcessorUtil {
     return attributes.buildOrThrow();
   }
 
-  static Struct encodeAttribute(String value) {
+  /**
+   * Encodes a single string attribute as Struct.
+   */
+  public static Struct encodeAttribute(String value) {
     return Struct.newBuilder()
         .putFields("", Value.newBuilder().setStringValue(value).build())
         .build();
   }
 
-  static Struct encodeHeaders(Metadata headers) {
+  /**
+   * Encodes metadata headers as Struct.
+   */
+  public static Struct encodeHeaders(Metadata headers) {
     Struct.Builder builder = Struct.newBuilder();
     for (String key : headers.keys()) {
       String value = getHeaderValue(headers, key);
@@ -162,8 +134,11 @@ final class ExternalProcessorUtil {
     return builder.build();
   }
 
+  /**
+   * Gets a header value from metadata.
+   */
   @Nullable
-  static String getHeaderValue(Metadata headers, String headerName) {
+  public static String getHeaderValue(Metadata headers, String headerName) {
     if (headerName.endsWith(Metadata.BINARY_HEADER_SUFFIX)) {
       Metadata.Key<byte[]> key = Metadata.Key.of(headerName, Metadata.BINARY_BYTE_MARSHALLER);
       Iterable<byte[]> values = headers.getAll(key);
@@ -179,5 +154,53 @@ final class ExternalProcessorUtil {
     Metadata.Key<String> key = Metadata.Key.of(headerName, Metadata.ASCII_STRING_MARSHALLER);
     Iterable<String> values = headers.getAll(key);
     return values == null ? null : Joiner.on(",").join(values);
+  }
+
+  /**
+   * Transitions ExtProcStreamState to COMPLETED.
+   */
+  public static boolean markExtProcStreamCompleted(
+      AtomicReference<ExtProcStreamState> extProcStreamState) {
+    while (true) {
+      ExtProcStreamState current = extProcStreamState.get();
+      if (current == ExtProcStreamState.COMPLETED || current == ExtProcStreamState.FAILED) {
+        return false;
+      }
+      if (extProcStreamState.compareAndSet(current, ExtProcStreamState.COMPLETED)) {
+        return true;
+      }
+    }
+  }
+
+  /**
+   * Transitions ExtProcStreamState to FAILED.
+   */
+  public static boolean markExtProcStreamFailed(
+      AtomicReference<ExtProcStreamState> extProcStreamState) {
+    while (true) {
+      ExtProcStreamState current = extProcStreamState.get();
+      if (current == ExtProcStreamState.COMPLETED || current == ExtProcStreamState.FAILED) {
+        return false;
+      }
+      if (extProcStreamState.compareAndSet(current, ExtProcStreamState.FAILED)) {
+        return true;
+      }
+    }
+  }
+
+  /**
+   * Transitions DataPlaneCallState to CLOSED.
+   */
+  public static boolean markDataPlaneCallClosed(
+      AtomicReference<DataPlaneCallState> dataPlaneCallState) {
+    while (true) {
+      DataPlaneCallState current = dataPlaneCallState.get();
+      if (current == DataPlaneCallState.CLOSED) {
+        return false;
+      }
+      if (dataPlaneCallState.compareAndSet(current, DataPlaneCallState.CLOSED)) {
+        return true;
+      }
+    }
   }
 }
