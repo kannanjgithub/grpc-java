@@ -18,10 +18,10 @@ package io.grpc.xds;
 
 import static com.google.common.base.Preconditions.checkNotNull;
 import static io.grpc.xds.ExternalProcessorHeaderUtil.toHeaderMap;
-import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.clientHalfCloseDuration;
-import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.clientHeadersDuration;
-import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.serverHeadersDuration;
-import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.serverTrailersDuration;
+import static io.grpc.xds.internal.extproc.ExternalProcessorClientInterceptorMetricInstruments.clientHalfCloseDuration;
+import static io.grpc.xds.internal.extproc.ExternalProcessorClientInterceptorMetricInstruments.clientHeadersDuration;
+import static io.grpc.xds.internal.extproc.ExternalProcessorClientInterceptorMetricInstruments.serverHeadersDuration;
+import static io.grpc.xds.internal.extproc.ExternalProcessorClientInterceptorMetricInstruments.serverTrailersDuration;
 import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.collectAttributes;
 import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.markDataPlaneCallClosed;
 import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.markExtProcStreamCompleted;
@@ -72,7 +72,7 @@ import io.grpc.xds.Filter.FilterContext;
 import io.grpc.xds.internal.extproc.DataPlaneCallState;
 import io.grpc.xds.internal.extproc.EventType;
 import io.grpc.xds.internal.extproc.ExtProcStreamState;
-import io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments;
+import io.grpc.xds.internal.extproc.ExternalProcessorClientInterceptorMetricInstruments;
 import io.grpc.xds.internal.extproc.KnownLengthInputStream;
 import io.grpc.xds.internal.grpcservice.CachedChannelManager;
 import io.grpc.xds.internal.grpcservice.HeaderValue;
@@ -116,7 +116,7 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
     checkNotNull(cachedChannelManager, "cachedChannelManager");
     this.scheduler = checkNotNull(scheduler, "scheduler");
     this.metricsRecorder = checkNotNull(context.metricsRecorder(), "metricsRecorder");
-    ExternalProcessorMetricInstruments.initMetricInstruments();
+    ExternalProcessorClientInterceptorMetricInstruments.initMetricInstruments();
     this.extProcChannel = cachedChannelManager.getChannel(filterConfig.getGrpcServiceConfig());
   }
 

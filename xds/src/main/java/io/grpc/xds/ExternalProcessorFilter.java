@@ -35,7 +35,7 @@ import io.grpc.ClientInterceptor;
 import io.grpc.internal.GrpcUtil;
 import io.grpc.xds.internal.MatcherParser;
 import io.grpc.xds.internal.Matchers;
-import io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments;
+import io.grpc.xds.internal.extproc.ExternalProcessorClientInterceptorMetricInstruments;
 import io.grpc.xds.internal.grpcservice.CachedChannelManager;
 import io.grpc.xds.internal.grpcservice.GrpcServiceConfig;
 import io.grpc.xds.internal.grpcservice.GrpcServiceParseException;
@@ -57,7 +57,7 @@ public class ExternalProcessorFilter implements Filter {
       "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor";
 
   static {
-    ExternalProcessorMetricInstruments.initMetricInstruments();
+    ExternalProcessorClientInterceptorMetricInstruments.initMetricInstruments();
   }
 
 
