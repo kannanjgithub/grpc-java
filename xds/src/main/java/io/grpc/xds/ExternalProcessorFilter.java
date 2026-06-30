@@ -30,14 +30,12 @@ import io.envoyproxy.envoy.config.core.v3.GrpcService;
 import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ExtProcOverrides;
 import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute;
 import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor;
-import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.HeaderForwardingRules;
 import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ProcessingMode;
 import io.grpc.ClientInterceptor;
 import io.grpc.Drainable;
 import io.grpc.ServerInterceptor;
 import io.grpc.internal.GrpcUtil;
-import io.grpc.xds.internal.MatcherParser;
-import io.grpc.xds.internal.Matchers;
+import io.grpc.xds.internal.HeaderForwardingRulesConfig;
 import io.grpc.xds.internal.extproc.ExternalProcessorClientInterceptorMetricInstruments;
 import io.grpc.xds.internal.grpcservice.CachedChannelManager;
 import io.grpc.xds.internal.grpcservice.GrpcServiceConfig;
@@ -48,7 +46,6 @@ import io.grpc.xds.internal.headermutations.HeaderMutationRulesParser;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.List;
-import java.util.Locale;
 import java.util.Optional;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -426,62 +423,5 @@ public class ExternalProcessorFilter implements Filter {
     }
   }
 
-  static final class HeaderForwardingRulesConfig {
-    private final ImmutableList<Matchers.StringMatcher> allowedHeaders;
-    private final ImmutableList<Matchers.StringMatcher> disallowedHeaders;
 
-    HeaderForwardingRulesConfig(
-        ImmutableList<Matchers.StringMatcher> allowedHeaders,
-        ImmutableList<Matchers.StringMatcher> disallowedHeaders) {
-      this.allowedHeaders = checkNotNull(allowedHeaders, "allowedHeaders");
-      this.disallowedHeaders = checkNotNull(disallowedHeaders, "disallowedHeaders");
-    }
-
-    static HeaderForwardingRulesConfig create(HeaderForwardingRules proto) {
-      ImmutableList<Matchers.StringMatcher> allowedHeaders = ImmutableList.of();
-      if (proto.hasAllowedHeaders()) {
-        allowedHeaders = MatcherParser.parseListStringMatcher(proto.getAllowedHeaders());
-      }
-      ImmutableList<Matchers.StringMatcher> disallowedHeaders = ImmutableList.of();
-      if (proto.hasDisallowedHeaders()) {
-        disallowedHeaders = MatcherParser.parseListStringMatcher(proto.getDisallowedHeaders());
-      }
-      return new HeaderForwardingRulesConfig(allowedHeaders, disallowedHeaders);
-    }
-
-    boolean isAllowed(String headerName) {
-      String lowerHeaderName = headerName.toLowerCase(Locale.ROOT);
-      if (!allowedHeaders.isEmpty()) {
-        boolean matched = false;
-        for (Matchers.StringMatcher matcher : allowedHeaders) {
-          if (matcher.matches(lowerHeaderName)) {
-            matched = true;
-            break;
-          }
-        }
-        if (!matched) {
-          return false;
-        }
-      }
-      if (!disallowedHeaders.isEmpty()) {
-        for (Matchers.StringMatcher matcher : disallowedHeaders) {
-          if (matcher.matches(lowerHeaderName)) {
-            return false;
-          }
-        }
-      }
-      return true;
-    }
-  }
-
-  static ByteString outboundStreamToByteString(InputStream message) throws IOException {
-    if (message instanceof Drainable) {
-      int size = message.available();
-      ByteString.Output output =
-          size > 0 ? ByteString.newOutput(size) : ByteString.newOutput();
-      ((Drainable) message).drainTo(output);
-      return output.toByteString();
-    }
-    return ByteString.readFrom(message);
-  }
 }
