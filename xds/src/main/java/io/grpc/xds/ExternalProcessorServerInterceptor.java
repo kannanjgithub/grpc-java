@@ -283,8 +283,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     private void activateCall() {
       if ((extProcStreamState.get() == ExtProcStreamState.FAILED
-              && !config.getObservabilityMode()
-              && (!config.getFailureModeAllow() || bodyMessageSentToExtProc.get()))
+              && !config.getFailureModeAllow()
+              && !config.getObservabilityMode())
           || !dataPlaneCallState.compareAndSet(
               DataPlaneCallState.IDLE, DataPlaneCallState.ACTIVE)) {
         return;
