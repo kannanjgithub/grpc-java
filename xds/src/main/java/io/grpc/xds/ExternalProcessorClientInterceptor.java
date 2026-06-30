@@ -21,6 +21,7 @@ import static io.grpc.xds.internal.extproc.ExternalProcessorClientInterceptorMet
 import static io.grpc.xds.internal.extproc.ExternalProcessorClientInterceptorMetricInstruments.clientHeadersDuration;
 import static io.grpc.xds.internal.extproc.ExternalProcessorClientInterceptorMetricInstruments.serverHeadersDuration;
 import static io.grpc.xds.internal.extproc.ExternalProcessorClientInterceptorMetricInstruments.serverTrailersDuration;
+import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.applyHeaderMutations;
 import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.collectAttributes;
 import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.markDataPlaneCallClosed;
 import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.markExtProcStreamCompleted;
@@ -31,7 +32,6 @@ import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.toHeaderMap;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.io.BaseEncoding;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Struct;
 import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ProcessingMode;
@@ -39,7 +39,6 @@ import io.envoyproxy.envoy.service.ext_proc.v3.BodyMutation;
 import io.envoyproxy.envoy.service.ext_proc.v3.BodyResponse;
 import io.envoyproxy.envoy.service.ext_proc.v3.CommonResponse;
 import io.envoyproxy.envoy.service.ext_proc.v3.ExternalProcessorGrpc;
-import io.envoyproxy.envoy.service.ext_proc.v3.HeaderMutation;
 import io.envoyproxy.envoy.service.ext_proc.v3.HttpBody;
 import io.envoyproxy.envoy.service.ext_proc.v3.HttpHeaders;
 import io.envoyproxy.envoy.service.ext_proc.v3.HttpTrailers;
@@ -76,13 +75,10 @@ import io.grpc.xds.internal.extproc.ExternalProcessorClientInterceptorMetricInst
 import io.grpc.xds.internal.extproc.KnownLengthInputStream;
 import io.grpc.xds.internal.grpcservice.CachedChannelManager;
 import io.grpc.xds.internal.grpcservice.HeaderValue;
-import io.grpc.xds.internal.grpcservice.HeaderValueValidationUtils;
 import io.grpc.xds.internal.headermutations.HeaderMutationDisallowedException;
 import io.grpc.xds.internal.headermutations.HeaderMutationFilter;
 import io.grpc.xds.internal.headermutations.HeaderMutationRulesConfig;
-import io.grpc.xds.internal.headermutations.HeaderMutations;
 import io.grpc.xds.internal.headermutations.HeaderMutator;
-import io.grpc.xds.internal.headermutations.HeaderValueOption;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Optional;
@@ -350,54 +346,7 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
       return true;
     }
 
-    private void applyHeaderMutations(Metadata metadata,
-        HeaderMutation mutation)
-        throws HeaderMutationDisallowedException {
-      if (metadata == null) {
-        return;
-      }
-      ImmutableList.Builder<HeaderValueOption> headersToModify = ImmutableList.builder();
-      for (io.envoyproxy.envoy.config.core.v3.HeaderValueOption protoOption
-          : mutation.getSetHeadersList()) {
-        io.envoyproxy.envoy.config.core.v3.HeaderValue protoHeader = protoOption.getHeader();
-        String key = protoHeader.getKey();
-        HeaderValueValidationUtils.validateHeaderKey(key);
 
-        ByteString rawBytes = protoHeader.getRawValue();
-        if (rawBytes.isEmpty()) {
-          rawBytes = ByteString.copyFromUtf8(protoHeader.getValue());
-        }
-
-        if (rawBytes.size() > HeaderValueValidationUtils.MAX_HEADER_LENGTH) {
-          throw new IllegalArgumentException(
-              "Header value length exceeds maximum allowed length: " + rawBytes.size());
-        }
-
-        HeaderValue headerValue;
-        if (key.endsWith(Metadata.BINARY_HEADER_SUFFIX)) {
-          byte[] decodedBytes = BaseEncoding.base64().decode(rawBytes.toStringUtf8());
-          headerValue = HeaderValue.create(key, ByteString.copyFrom(decodedBytes));
-        } else {
-          headerValue = HeaderValue.create(key, rawBytes.toStringUtf8());
-        }
-        headersToModify.add(HeaderValueOption.create(
-            headerValue,
-            HeaderValueOption.HeaderAppendAction.valueOf(protoOption.getAppendAction().name())));
-      }
-
-      ImmutableList.Builder<String> headersToRemove = ImmutableList.builder();
-      for (String headerToRemove : mutation.getRemoveHeadersList()) {
-        HeaderValueValidationUtils.validateHeaderKey(headerToRemove);
-        headersToRemove.add(headerToRemove);
-      }
-
-      HeaderMutations mutations = HeaderMutations.create(
-          headersToModify.build(),
-          headersToRemove.build());
-
-      HeaderMutations filteredMutations = mutationFilter.filter(mutations);
-      mutator.applyMutations(filteredMutations, metadata);
-    }
 
     @Override
     public void start(Listener<InputStream> responseListener, Metadata headers) {
@@ -505,7 +454,9 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
                 }
                 applyHeaderMutations(
                     requestHeaders,
-                    response.getRequestHeaders().getResponse().getHeaderMutation());
+                    response.getRequestHeaders().getResponse().getHeaderMutation(),
+                    mutationFilter,
+                    mutator);
               }
               activateCall();
             }
@@ -528,7 +479,10 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
                 Metadata target = wrappedListener.isTrailersOnly()
                     ? wrappedListener.getSavedTrailers() : wrappedListener.getSavedHeaders();
                 applyHeaderMutations(
-                    target, response.getResponseHeaders().getResponse().getHeaderMutation());
+                    target,
+                    response.getResponseHeaders().getResponse().getHeaderMutation(),
+                    mutationFilter,
+                    mutator);
               }
               if (wrappedListener.isTrailersOnly()) {
                 wrappedListener.proceedWithClose();
@@ -547,8 +501,9 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
               if (response.getResponseTrailers().hasHeaderMutation()) {
                 applyHeaderMutations(
                     wrappedListener.getSavedTrailers(),
-                    response.getResponseTrailers().getHeaderMutation()
-                );
+                    response.getResponseTrailers().getHeaderMutation(),
+                    mutationFilter,
+                    mutator);
               }
               wrappedListener.proceedWithClose();
             }
@@ -902,7 +857,7 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
 
       Metadata trailers = new Metadata();
       if (immediate.hasHeaders()) {
-        applyHeaderMutations(trailers, immediate.getHeaders());
+        applyHeaderMutations(trailers, immediate.getHeaders(), mutationFilter, mutator);
       }
 
       listener.setImmediateResponse(status, trailers);
