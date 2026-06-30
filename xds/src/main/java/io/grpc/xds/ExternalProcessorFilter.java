@@ -33,9 +33,7 @@ import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
 import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.HeaderForwardingRules;
 import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ProcessingMode;
 import io.grpc.ClientInterceptor;
-import io.grpc.DoubleHistogramMetricInstrument;
 import io.grpc.Drainable;
-import io.grpc.MetricInstrumentRegistry;
 import io.grpc.ServerInterceptor;
 import io.grpc.internal.GrpcUtil;
 import io.grpc.xds.internal.MatcherParser;
@@ -67,30 +65,7 @@ public class ExternalProcessorFilter implements Filter {
     ExternalProcessorMetricInstruments.initMetricInstruments();
   }
 
-  enum ExtProcStreamState {
-    ACTIVE,
-    DRAINING,
-    COMPLETED,
-    FAILED;
 
-    boolean isCompleted() {
-      return this == COMPLETED || this == FAILED;
-    }
-
-    boolean isFailed() {
-      return this == FAILED;
-    }
-
-    boolean isDraining() {
-      return this == DRAINING;
-    }
-  }
-
-  enum DataPlaneCallState {
-    IDLE,
-    ACTIVE,
-    CLOSED
-  }
 
   private final CachedChannelManager cachedChannelManager;
   private final FilterContext context;

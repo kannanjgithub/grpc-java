@@ -17,13 +17,16 @@
 package io.grpc.xds;
 
 import static com.google.common.base.Preconditions.checkNotNull;
-import static io.grpc.xds.ExternalProcessorUtil.collectAttributes;
-import static io.grpc.xds.ExternalProcessorUtil.outboundStreamToByteString;
-import static io.grpc.xds.ExternalProcessorUtil.toHeaderMap;
+import static io.grpc.xds.ExternalProcessorHeaderUtil.toHeaderMap;
 import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.clientHalfCloseDuration;
 import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.clientHeadersDuration;
 import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.serverHeadersDuration;
 import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.serverTrailersDuration;
+import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.collectAttributes;
+import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.markDataPlaneCallClosed;
+import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.markExtProcStreamCompleted;
+import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.markExtProcStreamFailed;
+import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.outboundStreamToByteString;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -63,10 +66,11 @@ import io.grpc.internal.SharedResourceHolder;
 import io.grpc.stub.ClientCallStreamObserver;
 import io.grpc.stub.ClientResponseObserver;
 import io.grpc.stub.MetadataUtils;
-import io.grpc.xds.ExternalProcessorFilter.DataPlaneCallState;
-import io.grpc.xds.ExternalProcessorFilter.ExtProcStreamState;
 import io.grpc.xds.ExternalProcessorFilter.ExternalProcessorFilterConfig;
 import io.grpc.xds.Filter.FilterContext;
+import io.grpc.xds.internal.extproc.DataPlaneCallState;
+import io.grpc.xds.internal.extproc.EventType;
+import io.grpc.xds.internal.extproc.ExtProcStreamState;
 import io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments;
 import io.grpc.xds.internal.extproc.KnownLengthInputStream;
 import io.grpc.xds.internal.grpcservice.CachedChannelManager;
@@ -172,13 +176,6 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
 
   private static class DataPlaneServerCall extends SimpleForwardingServerCall<InputStream, InputStream> {
-    private enum EventType {
-      REQUEST_HEADERS,
-      REQUEST_BODY,
-      RESPONSE_HEADERS,
-      RESPONSE_BODY,
-      RESPONSE_TRAILERS
-    }
 
     private final ServerCall<InputStream, InputStream> rawCall;
     private final ExternalProcessorGrpc.ExternalProcessorStub extProcStub;
@@ -273,52 +270,15 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     }
 
     boolean isExtProcStreamCompleted() {
-      ExtProcStreamState s = extProcStreamState.get();
-      return s == ExtProcStreamState.COMPLETED || s == ExtProcStreamState.FAILED;
+      return extProcStreamState.get().isCompleted();
     }
 
     boolean isExtProcStreamFailed() {
-      return extProcStreamState.get() == ExtProcStreamState.FAILED;
+      return extProcStreamState.get().isFailed();
     }
 
     boolean isExtProcStreamDraining() {
-      return extProcStreamState.get() == ExtProcStreamState.DRAINING;
-    }
-
-    boolean markExtProcStreamCompleted() {
-      while (true) {
-        ExtProcStreamState current = extProcStreamState.get();
-        if (current == ExtProcStreamState.COMPLETED || current == ExtProcStreamState.FAILED) {
-          return false;
-        }
-        if (extProcStreamState.compareAndSet(current, ExtProcStreamState.COMPLETED)) {
-          return true;
-        }
-      }
-    }
-
-    boolean markExtProcStreamFailed() {
-      while (true) {
-        ExtProcStreamState current = extProcStreamState.get();
-        if (current == ExtProcStreamState.COMPLETED || current == ExtProcStreamState.FAILED) {
-          return false;
-        }
-        if (extProcStreamState.compareAndSet(current, ExtProcStreamState.FAILED)) {
-          return true;
-        }
-      }
-    }
-
-    boolean markDataPlaneCallClosed() {
-      while (true) {
-        DataPlaneCallState current = dataPlaneCallState.get();
-        if (current == DataPlaneCallState.CLOSED) {
-          return false;
-        }
-        if (dataPlaneCallState.compareAndSet(current, DataPlaneCallState.CLOSED)) {
-          return true;
-        }
-      }
+      return extProcStreamState.get().isDraining();
     }
 
     private void activateCall() {
@@ -374,7 +334,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
             }
           }
           activateCall();
-          markExtProcStreamFailed();
+          markExtProcStreamFailed(extProcStreamState);
           rawCall.close(Status.UNAVAILABLE.withDescription("gRPC message compression not supported in ext_proc"), new Metadata());
           closeExtProcStream();
           return false;
@@ -557,7 +517,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
         @Override
         public void onError(Throwable t) {
-          if (markExtProcStreamFailed()) {
+          if (markExtProcStreamFailed(extProcStreamState)) {
             synchronized (streamLock) {
               extProcClientCallRequestObserver = null;
             }
@@ -572,7 +532,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
         @Override
         public void onCompleted() {
-          if (markExtProcStreamCompleted()) {
+          if (markExtProcStreamCompleted(extProcStreamState)) {
             handleFailOpen();
           }
         }
@@ -662,7 +622,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     private void closeExtProcStream() {
       synchronized (streamLock) {
-        if (markExtProcStreamCompleted()) {
+        if (markExtProcStreamCompleted(extProcStreamState)) {
           if (extProcClientCallRequestObserver != null) {
             extProcClientCallRequestObserver.onCompleted();
           }
@@ -673,7 +633,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     }
 
     private void cancelExtProcStream(Throwable t) {
-      if (markExtProcStreamFailed()) {
+      if (markExtProcStreamFailed(extProcStreamState)) {
         synchronized (streamLock) {
           if (extProcClientCallRequestObserver != null) {
             try {
@@ -689,7 +649,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     }
 
     private void internalOnError(Throwable t) {
-      if (markExtProcStreamFailed()) {
+      if (markExtProcStreamFailed(extProcStreamState)) {
         synchronized (streamLock) {
           if (extProcClientCallRequestObserver != null) {
             try {
@@ -892,7 +852,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       if (isExtProcStreamFailed()
           && !config.getObservabilityMode()
           && (!config.getFailureModeAllow() || bodyMessageSentToExtProc.get())) {
-        if (markDataPlaneCallClosed()) {
+        if (markDataPlaneCallClosed(dataPlaneCallState)) {
           proceedWithClose(Status.INTERNAL.withDescription("External processor stream failed").withCause(status.getCause()), new Metadata());
         }
         return;
@@ -900,7 +860,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
       synchronized (rawCallLock) {
         if (passThroughMode.get()) {
-          if (markDataPlaneCallClosed()) {
+          if (markDataPlaneCallClosed(dataPlaneCallState)) {
             proceedWithClose(status, trailers);
           }
           closeExtProcStream();
@@ -942,7 +902,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       synchronized (rawCallLock) {
         if (savedStatus != null 
             && (isExtProcStreamCompleted() || config.getObservabilityMode())) {
-          if (markDataPlaneCallClosed()) {
+          if (markDataPlaneCallClosed(dataPlaneCallState)) {
             proceedWithClose(savedStatus, savedTrailers);
           }
           savedStatus = null;

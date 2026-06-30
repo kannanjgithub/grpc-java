@@ -17,13 +17,16 @@
 package io.grpc.xds;
 
 import static com.google.common.base.Preconditions.checkNotNull;
-import static io.grpc.xds.ExternalProcessorUtil.collectAttributes;
-import static io.grpc.xds.ExternalProcessorUtil.outboundStreamToByteString;
-import static io.grpc.xds.ExternalProcessorUtil.toHeaderMap;
+import static io.grpc.xds.ExternalProcessorHeaderUtil.toHeaderMap;
 import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.clientHalfCloseDuration;
 import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.clientHeadersDuration;
 import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.serverHeadersDuration;
 import static io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments.serverTrailersDuration;
+import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.collectAttributes;
+import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.markDataPlaneCallClosed;
+import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.markExtProcStreamCompleted;
+import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.markExtProcStreamFailed;
+import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.outboundStreamToByteString;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
@@ -64,10 +67,11 @@ import io.grpc.internal.DelayedClientCall;
 import io.grpc.internal.SerializingExecutor;
 import io.grpc.stub.ClientCallStreamObserver;
 import io.grpc.stub.ClientResponseObserver;
-import io.grpc.xds.ExternalProcessorFilter.DataPlaneCallState;
-import io.grpc.xds.ExternalProcessorFilter.ExtProcStreamState;
 import io.grpc.xds.ExternalProcessorFilter.ExternalProcessorFilterConfig;
 import io.grpc.xds.Filter.FilterContext;
+import io.grpc.xds.internal.extproc.DataPlaneCallState;
+import io.grpc.xds.internal.extproc.EventType;
+import io.grpc.xds.internal.extproc.ExtProcStreamState;
 import io.grpc.xds.internal.extproc.ExternalProcessorMetricInstruments;
 import io.grpc.xds.internal.extproc.KnownLengthInputStream;
 import io.grpc.xds.internal.grpcservice.CachedChannelManager;
@@ -207,13 +211,6 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
    */
   private static class DataPlaneClientCall 
       extends SimpleForwardingClientCall<InputStream, InputStream> {
-    private enum EventType {
-      REQUEST_HEADERS,
-      REQUEST_BODY,
-      RESPONSE_HEADERS,
-      RESPONSE_BODY,
-      RESPONSE_TRAILERS
-    }
 
     private final ExternalProcessorGrpc.ExternalProcessorStub stub;
     private final ExternalProcessorFilterConfig config;
@@ -286,41 +283,6 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
     }
 
 
-    boolean markExtProcStreamCompleted() {
-      while (true) {
-        ExtProcStreamState current = extProcStreamState.get();
-        if (current == ExtProcStreamState.COMPLETED || current == ExtProcStreamState.FAILED) {
-          return false;
-        }
-        if (extProcStreamState.compareAndSet(current, ExtProcStreamState.COMPLETED)) {
-          return true;
-        }
-      }
-    }
-
-    boolean markExtProcStreamFailed() {
-      while (true) {
-        ExtProcStreamState current = extProcStreamState.get();
-        if (current == ExtProcStreamState.COMPLETED || current == ExtProcStreamState.FAILED) {
-          return false;
-        }
-        if (extProcStreamState.compareAndSet(current, ExtProcStreamState.FAILED)) {
-          return true;
-        }
-      }
-    }
-
-    boolean markDataPlaneCallClosed() {
-      while (true) {
-        DataPlaneCallState current = dataPlaneCallState.get();
-        if (current == DataPlaneCallState.CLOSED) {
-          return false;
-        }
-        if (dataPlaneCallState.compareAndSet(current, DataPlaneCallState.CLOSED)) {
-          return true;
-        }
-      }
-    }
 
     private void activateCall() {
       if ((extProcStreamState.get() == ExtProcStreamState.FAILED
@@ -379,7 +341,7 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
             }
           }
           activateCall();
-          markExtProcStreamFailed();
+          markExtProcStreamFailed(extProcStreamState);
           delayedCall.cancel("gRPC message compression not supported in ext_proc", ex);
           closeExtProcStream();
           return false;
@@ -599,7 +561,7 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
 
         @Override
         public void onError(Throwable t) {
-          if (markExtProcStreamFailed()) {
+          if (markExtProcStreamFailed(extProcStreamState)) {
             synchronized (streamLock) {
               extProcClientCallRequestObserver = null;
             }
@@ -616,7 +578,7 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
 
         @Override
         public void onCompleted() {
-          if (markExtProcStreamCompleted()) {
+          if (markExtProcStreamCompleted(extProcStreamState)) {
             handleFailOpen(wrappedListener);
           }
         }
@@ -705,7 +667,7 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
 
     private void closeExtProcStream() {
       synchronized (streamLock) {
-        if (markExtProcStreamCompleted()) {
+        if (markExtProcStreamCompleted(extProcStreamState)) {
           if (extProcClientCallRequestObserver != null) {
             extProcClientCallRequestObserver.onCompleted();
           }
@@ -714,7 +676,7 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
     }
 
     private void internalOnError(Throwable t) {
-      if (markExtProcStreamFailed()) {
+      if (markExtProcStreamFailed(extProcStreamState)) {
         synchronized (streamLock) {
           if (extProcClientCallRequestObserver != null) {
             try {
@@ -1176,14 +1138,14 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
           && !dataPlaneClientCall.getConfig().getObservabilityMode()
           && (!dataPlaneClientCall.getConfig().getFailureModeAllow()
               || dataPlaneClientCall.bodyMessageSentToExtProc.get())) {
-        if (dataPlaneClientCall.markDataPlaneCallClosed()) {
+        if (markDataPlaneCallClosed(dataPlaneClientCall.dataPlaneCallState)) {
           proceedWithClose(Status.INTERNAL.withDescription("External processor stream failed")
               .withCause(status.getCause()), new Metadata());
         }
         return;
       }
       if (dataPlaneClientCall.getPassThroughMode().get()) {
-        if (dataPlaneClientCall.markDataPlaneCallClosed()) {
+        if (markDataPlaneCallClosed(dataPlaneClientCall.dataPlaneCallState)) {
           proceedWithClose(status, trailers);
         }
         return;
@@ -1254,7 +1216,7 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
 
     void proceedWithClose() {
       if (savedStatus != null) {
-        if (dataPlaneClientCall.markDataPlaneCallClosed()) {
+        if (markDataPlaneCallClosed(dataPlaneClientCall.dataPlaneCallState)) {
           proceedWithClose(savedStatus, savedTrailers);
         }
         savedStatus = null;
