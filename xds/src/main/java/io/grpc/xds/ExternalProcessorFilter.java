@@ -21,7 +21,6 @@ import static com.google.common.base.Preconditions.checkNotNull;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.protobuf.Any;
-import com.google.protobuf.ByteString;
 import com.google.protobuf.Duration;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Message;
@@ -32,19 +31,15 @@ import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute;
 import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor;
 import io.envoyproxy.envoy.extensions.filters.http.ext_proc.v3.ProcessingMode;
 import io.grpc.ClientInterceptor;
-import io.grpc.Drainable;
 import io.grpc.ServerInterceptor;
 import io.grpc.internal.GrpcUtil;
 import io.grpc.xds.internal.HeaderForwardingRulesConfig;
-import io.grpc.xds.internal.extproc.ExternalProcessorClientInterceptorMetricInstruments;
 import io.grpc.xds.internal.grpcservice.CachedChannelManager;
 import io.grpc.xds.internal.grpcservice.GrpcServiceConfig;
 import io.grpc.xds.internal.grpcservice.GrpcServiceParseException;
 import io.grpc.xds.internal.headermutations.HeaderMutationRulesConfig;
 import io.grpc.xds.internal.headermutations.HeaderMutationRulesParseException;
 import io.grpc.xds.internal.headermutations.HeaderMutationRulesParser;
-import java.io.IOException;
-import java.io.InputStream;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ScheduledExecutorService;
@@ -58,9 +53,7 @@ public class ExternalProcessorFilter implements Filter {
   static final String TYPE_URL = 
       "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor";
 
-  static {
-    ExternalProcessorClientInterceptorMetricInstruments.initMetricInstruments();
-  }
+
 
 
 

@@ -17,10 +17,6 @@
 package io.grpc.xds;
 
 import static com.google.common.base.Preconditions.checkNotNull;
-import static io.grpc.xds.internal.extproc.ExternalProcessorServerInterceptorMetricInstruments.clientHalfCloseDuration;
-import static io.grpc.xds.internal.extproc.ExternalProcessorServerInterceptorMetricInstruments.clientHeadersDuration;
-import static io.grpc.xds.internal.extproc.ExternalProcessorServerInterceptorMetricInstruments.serverHeadersDuration;
-import static io.grpc.xds.internal.extproc.ExternalProcessorServerInterceptorMetricInstruments.serverTrailersDuration;
 import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.applyHeaderMutations;
 import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.collectAttributes;
 import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.markDataPlaneCallClosed;
@@ -29,6 +25,7 @@ import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.markExtProcStre
 import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.outboundStreamToByteString;
 import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.toHeaderMap;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.util.concurrent.MoreExecutors;
@@ -53,6 +50,7 @@ import io.grpc.ForwardingServerCall.SimpleForwardingServerCall;
 import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
+import io.grpc.MetricInstrumentRegistry;
 import io.grpc.MetricRecorder;
 import io.grpc.ServerCall;
 import io.grpc.ServerCallHandler;
@@ -70,7 +68,6 @@ import io.grpc.xds.Filter.FilterContext;
 import io.grpc.xds.internal.extproc.DataPlaneCallState;
 import io.grpc.xds.internal.extproc.EventType;
 import io.grpc.xds.internal.extproc.ExtProcStreamState;
-import io.grpc.xds.internal.extproc.ExternalProcessorServerInterceptorMetricInstruments;
 import io.grpc.xds.internal.extproc.KnownLengthInputStream;
 import io.grpc.xds.internal.grpcservice.CachedChannelManager;
 import io.grpc.xds.internal.grpcservice.HeaderValue;
@@ -80,6 +77,7 @@ import io.grpc.xds.internal.headermutations.HeaderMutationRulesConfig;
 import io.grpc.xds.internal.headermutations.HeaderMutator;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.List;
 import java.util.Optional;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -97,7 +95,77 @@ import javax.annotation.Nullable;
  * Server-side interceptor for external processing filter.
  */
 final class ExternalProcessorServerInterceptor implements ServerInterceptor {
-  private static final Logger logger = Logger.getLogger(ExternalProcessorServerInterceptor.class.getName());
+  private static final Logger logger = Logger.getLogger(
+      ExternalProcessorServerInterceptor.class.getName());
+
+  @VisibleForTesting
+  static DoubleHistogramMetricInstrument clientHeadersDuration;
+  @VisibleForTesting
+  static DoubleHistogramMetricInstrument clientHalfCloseDuration;
+  @VisibleForTesting
+  static DoubleHistogramMetricInstrument serverHeadersDuration;
+  @VisibleForTesting
+  static DoubleHistogramMetricInstrument serverTrailersDuration;
+
+  // Copied from io.grpc.opentelemetry.internal.OpenTelemetryConstants.LATENCY_BUCKETS
+  private static final List<Double> LATENCY_BUCKETS = ImmutableList.of(
+      0d,     0.00001d, 0.00005d, 0.0001d, 0.0003d, 0.0006d, 0.0008d, 0.001d, 0.002d,
+      0.003d, 0.004d,   0.005d,   0.006d,  0.008d,  0.01d,   0.013d,  0.016d, 0.02d,
+      0.025d, 0.03d,    0.04d,    0.05d,   0.065d,  0.08d,   0.1d,    0.13d,  0.16d,
+      0.2d,   0.25d,    0.3d,     0.4d,    0.5d,    0.65d,   0.8d,    1d,     2d,
+      5d,     10d,      20d,      50d,     100d);
+
+  static {
+    initMetricInstruments();
+  }
+
+  public static synchronized void initMetricInstruments() {
+    if (GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_SERVER", false)) {
+      if (clientHeadersDuration == null) {
+        MetricInstrumentRegistry registry = MetricInstrumentRegistry.getDefaultRegistry();
+
+        clientHeadersDuration = registry.registerDoubleHistogram(
+            "grpc.server_ext_proc.client_headers_duration",
+            "Time between when the ext_proc filter sees the client's headers and when "
+                + "it allows those headers to continue on to the next filter",
+            "s",
+            LATENCY_BUCKETS,
+            ImmutableList.of(),
+            ImmutableList.of(),
+            true);
+
+        clientHalfCloseDuration = registry.registerDoubleHistogram(
+            "grpc.server_ext_proc.client_half_close_duration",
+            "Time between when the ext_proc filter sees the client's half-close and when "
+                + "it allows that half-close to continue on to the next filter",
+            "s",
+            LATENCY_BUCKETS,
+            ImmutableList.of(),
+            ImmutableList.of(),
+            true);
+
+        serverHeadersDuration = registry.registerDoubleHistogram(
+            "grpc.server_ext_proc.server_headers_duration",
+            "Time between when the ext_proc filter sees the server's headers and when "
+                + "it allows those headers to continue on to the next filter",
+            "s",
+            LATENCY_BUCKETS,
+            ImmutableList.of(),
+            ImmutableList.of(),
+            true);
+
+        serverTrailersDuration = registry.registerDoubleHistogram(
+            "grpc.server_ext_proc.server_trailers_duration",
+            "Time between when the ext_proc filter sees the server's trailers and when "
+                + "it allows those trailers to continue on to the next filter",
+            "s",
+            LATENCY_BUCKETS,
+            ImmutableList.of(),
+            ImmutableList.of(),
+            true);
+      }
+    }
+  }
 
   private final ExternalProcessorFilterConfig filterConfig;
   private final MetricRecorder metricsRecorder;
@@ -110,7 +178,6 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     this.filterConfig = checkNotNull(filterConfig, "filterConfig");
     checkNotNull(cachedChannelManager, "cachedChannelManager");
     this.metricsRecorder = checkNotNull(context.metricsRecorder(), "metricsRecorder");
-    ExternalProcessorServerInterceptorMetricInstruments.initMetricInstruments();
     this.extProcChannel = cachedChannelManager.getChannel(filterConfig.getGrpcServiceConfig());
   }
 
@@ -123,7 +190,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
   public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
       ServerCall<ReqT, RespT> call, Metadata headers, ServerCallHandler<ReqT, RespT> next) {
     ServerCall<InputStream, InputStream> rawCall = (ServerCall<InputStream, InputStream>) call;
-    ServerCallHandler<InputStream, InputStream> rawNext = (ServerCallHandler<InputStream, InputStream>) next;
+    ServerCallHandler<InputStream, InputStream> rawNext =
+        (ServerCallHandler<InputStream, InputStream>) next;
 
     ExternalProcessorGrpc.ExternalProcessorStub extProcStub = ExternalProcessorGrpc.newStub(
         extProcChannel)
@@ -171,7 +239,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
   }
 
 
-  private static class DataPlaneServerCall extends SimpleForwardingServerCall<InputStream, InputStream> {
+  private static class DataPlaneServerCall
+      extends SimpleForwardingServerCall<InputStream, InputStream> {
 
     private final ServerCall<InputStream, InputStream> rawCall;
     private final ExternalProcessorGrpc.ExternalProcessorStub extProcStub;
@@ -331,7 +400,10 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
           }
           activateCall();
           markExtProcStreamFailed(extProcStreamState);
-          rawCall.close(Status.UNAVAILABLE.withDescription("gRPC message compression not supported in ext_proc"), new Metadata());
+          rawCall.close(
+              Status.UNAVAILABLE.withDescription(
+                  "gRPC message compression not supported in ext_proc"),
+              new Metadata());
           closeExtProcStream();
           return false;
         }
@@ -480,7 +552,10 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
                 || (config.getFailureModeAllow() && !bodyMessageSentToExtProc.get())) {
               handleFailOpen();
             } else {
-              rawCall.close(Status.INTERNAL.withDescription("External processor stream failed").withCause(t), new Metadata());
+              rawCall.close(
+                  Status.INTERNAL.withDescription("External processor stream failed")
+                      .withCause(t),
+                  new Metadata());
             }
           }
         }
@@ -594,6 +669,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
             try {
               extProcClientCallRequestObserver.onError(t);
             } catch (Throwable ignored) {
+              // Ignore exceptions during cancel/onError propagation
             }
             extProcClientCallRequestObserver = null;
           }
@@ -610,6 +686,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
             try {
               extProcClientCallRequestObserver.onError(t);
             } catch (Throwable ignored) {
+              // Ignore exceptions during cancel/onError propagation
             }
             extProcClientCallRequestObserver = null;
           }
@@ -619,7 +696,9 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
             || (config.getFailureModeAllow() && !bodyMessageSentToExtProc.get())) {
           handleFailOpen();
         } else {
-          rawCall.close(Status.INTERNAL.withDescription("External processor stream failed").withCause(t), new Metadata());
+          rawCall.close(
+              Status.INTERNAL.withDescription("External processor stream failed").withCause(t),
+              new Metadata());
         }
       }
     }
@@ -755,7 +834,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
         // prevent a Check-Then-Act race condition. If they were checked lock-free, a context
         // switch immediately after the check but before adding to the queue would allow a
         // concurrent control plane thread to finish draining first. The resuming thread would
-        // then insert the message into a queue that will never be drained again, causing a hung call.
+        // then insert the message into a queue that will never be drained again,
+        // causing a hung call.
 
         // Check-Then-Act: Atomically verify headers sending state and queue message
         if (savedResponseHeaders != null) {
@@ -763,7 +843,9 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
             ByteString copiedBytes = ByteString.readFrom(message);
             savedOutgoingMessages.add(new KnownLengthInputStream(copiedBytes));
           } catch (IOException e) {
-            rawCall.close(Status.INTERNAL.withDescription("Failed to serialize response body").withCause(e), new Metadata());
+            rawCall.close(
+                Status.INTERNAL.withDescription("Failed to serialize response body").withCause(e),
+                new Metadata());
           }
           return;
         }
@@ -774,7 +856,9 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
             ByteString copiedBytes = ByteString.readFrom(message);
             pendingDrainingMessages.add(new KnownLengthInputStream(copiedBytes));
           } catch (IOException e) {
-            rawCall.close(Status.INTERNAL.withDescription("Failed to serialize response body").withCause(e), new Metadata());
+            rawCall.close(
+                Status.INTERNAL.withDescription("Failed to serialize response body").withCause(e),
+                new Metadata());
           }
           return;
         }
@@ -797,7 +881,9 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
           }
         }
       } catch (IOException e) {
-        rawCall.close(Status.INTERNAL.withDescription("Failed to serialize response body").withCause(e), new Metadata());
+        rawCall.close(
+            Status.INTERNAL.withDescription("Failed to serialize response body").withCause(e),
+            new Metadata());
       }
     }
 
@@ -808,7 +894,10 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
           && !config.getObservabilityMode()
           && (!config.getFailureModeAllow() || bodyMessageSentToExtProc.get())) {
         if (markDataPlaneCallClosed(dataPlaneCallState)) {
-          proceedWithClose(Status.INTERNAL.withDescription("External processor stream failed").withCause(status.getCause()), new Metadata());
+          proceedWithClose(
+              Status.INTERNAL.withDescription("External processor stream failed")
+                  .withCause(status.getCause()),
+              new Metadata());
         }
         return;
       }
@@ -924,7 +1013,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       }
     }
 
-    private void sendResponseBodyToExtProc(@Nullable ByteString bodyByteString, boolean endOfStream) {
+    private void sendResponseBodyToExtProc(
+        @Nullable ByteString bodyByteString, boolean endOfStream) {
       if (isExtProcStreamCompleted()
           || currentProcessingMode.getResponseBodyMode() != ProcessingMode.BodySendMode.GRPC) {
         return;
@@ -944,7 +1034,7 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     private void handleRequestBodyResponse(BodyResponse bodyResponse) {
       if (bodyResponse.hasResponse()
-      && bodyResponse.getResponse().hasBodyMutation()) {
+          && bodyResponse.getResponse().hasBodyMutation()) {
         BodyMutation mutation = bodyResponse.getResponse().getBodyMutation();
         if (mutation.hasStreamedResponse()) {
           StreamedBodyResponse streamed = mutation.getStreamedResponse();
@@ -1026,7 +1116,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
      * <p>The stream is only closed if:
      * <ul>
      *   <li>Call termination has been initiated ({@code terminationTriggered} is true).</li>
-     *   <li>The request side of the call is fully completed ({@code isRequestSideCompleted} is true).</li>
+     *   <li>The request side of the call is fully completed ({@code isRequestSideCompleted}
+      *       is true).</li>
      *   <li>There are no outstanding response-side messages (such as mutated response headers
      *       or trailers) expected from the external processor.</li>
      * </ul>
@@ -1178,7 +1269,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
           return;
         }
         ServerCall.Listener<InputStream> del = delegate;
-        if ((dataPlaneServerCall.passThroughMode.get() || dataPlaneServerCall.isExtProcStreamCompleted()) && del != null) {
+        if ((dataPlaneServerCall.passThroughMode.get()
+            || dataPlaneServerCall.isExtProcStreamCompleted()) && del != null) {
           proceedWithHalfClose();
           return;
         }
@@ -1188,7 +1280,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
           return;
         }
 
-        if (dataPlaneServerCall.currentProcessingMode.getRequestBodyMode() == ProcessingMode.BodySendMode.NONE) {
+        if (dataPlaneServerCall.currentProcessingMode.getRequestBodyMode()
+            == ProcessingMode.BodySendMode.NONE) {
           proceedWithHalfClose();
           return;
         }
@@ -1199,7 +1292,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
 
     void handleDeferredHalfClose() {
       dataPlaneServerCall.syncContext.execute(() -> {
-        if (dataPlaneServerCall.currentProcessingMode.getRequestBodyMode() == ProcessingMode.BodySendMode.NONE
+        if (dataPlaneServerCall.currentProcessingMode.getRequestBodyMode()
+                == ProcessingMode.BodySendMode.NONE
             || dataPlaneServerCall.isExtProcStreamCompleted()) {
           proceedWithHalfClose();
         } else {
@@ -1228,7 +1322,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
     void onExternalBody(ByteString body) {
       ServerCall.Listener<InputStream> del = delegate;
       // In the future, if zero-copy reads are needed downstream, this can be optimized
-      // by wrapping the ByteString in an InputStream that implements HasByteBuffer, KnownLength, and Detachable.
+      // by wrapping the ByteString in an InputStream that implements HasByteBuffer,
+      // KnownLength, and Detachable.
       if (del != null) {
         dataPlaneServerCall.callContext.run(() -> del.onMessage(body.newInput()));
       } else {
@@ -1236,7 +1331,8 @@ final class ExternalProcessorServerInterceptor implements ServerInterceptor {
       }
     }
 
-    private void sendRequestBodyToExtProc(@Nullable ByteString bodyByteString, boolean endOfStream) {
+    private void sendRequestBodyToExtProc(
+        @Nullable ByteString bodyByteString, boolean endOfStream) {
       if (dataPlaneServerCall.isExtProcStreamCompleted()
           || dataPlaneServerCall.currentProcessingMode.getRequestBodyMode()
               != ProcessingMode.BodySendMode.GRPC) {

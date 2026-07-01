@@ -35,7 +35,6 @@ import io.grpc.InternalServerInterceptors;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
 import io.grpc.MetricRecorder;
-import java.io.InputStream;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import io.grpc.ServerCall;
@@ -66,6 +65,7 @@ import io.grpc.xds.client.XdsClient;
 import io.grpc.xds.client.XdsClient.ResourceWatcher;
 import io.grpc.xds.internal.security.SslContextProviderSupplier;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.InetAddress;
 import java.net.SocketAddress;
 import java.util.ArrayList;
@@ -991,11 +991,11 @@ final class XdsServerWrapper extends Server {
           (ServerCall.Listener<ReqT>) (ServerCall.Listener<?>)
               new SimpleForwardingServerCallListener<InputStream>(
                   (ServerCall.Listener<InputStream>) (ServerCall.Listener<?>) appListener) {
-                @Override
-                public void onMessage(InputStream message) {
-                  appListener.onMessage(originalMethod.getRequestMarshaller().parse(message));
-                }
-              };
+            @Override
+            public void onMessage(InputStream message) {
+              appListener.onMessage(originalMethod.getRequestMarshaller().parse(message));
+            }
+          };
 
       return rawListener;
     }

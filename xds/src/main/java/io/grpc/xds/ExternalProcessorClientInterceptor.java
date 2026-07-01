@@ -17,10 +17,6 @@
 package io.grpc.xds;
 
 import static com.google.common.base.Preconditions.checkNotNull;
-import static io.grpc.xds.internal.extproc.ExternalProcessorClientInterceptorMetricInstruments.clientHalfCloseDuration;
-import static io.grpc.xds.internal.extproc.ExternalProcessorClientInterceptorMetricInstruments.clientHeadersDuration;
-import static io.grpc.xds.internal.extproc.ExternalProcessorClientInterceptorMetricInstruments.serverHeadersDuration;
-import static io.grpc.xds.internal.extproc.ExternalProcessorClientInterceptorMetricInstruments.serverTrailersDuration;
 import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.applyHeaderMutations;
 import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.collectAttributes;
 import static io.grpc.xds.internal.extproc.ExternalProcessorUtil.markDataPlaneCallClosed;
@@ -59,6 +55,7 @@ import io.grpc.ForwardingClientCallListener.SimpleForwardingClientCallListener;
 import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
+import io.grpc.MetricInstrumentRegistry;
 import io.grpc.MetricRecorder;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
@@ -71,7 +68,6 @@ import io.grpc.xds.Filter.FilterContext;
 import io.grpc.xds.internal.extproc.DataPlaneCallState;
 import io.grpc.xds.internal.extproc.EventType;
 import io.grpc.xds.internal.extproc.ExtProcStreamState;
-import io.grpc.xds.internal.extproc.ExternalProcessorClientInterceptorMetricInstruments;
 import io.grpc.xds.internal.extproc.KnownLengthInputStream;
 import io.grpc.xds.internal.grpcservice.CachedChannelManager;
 import io.grpc.xds.internal.grpcservice.HeaderValue;
@@ -81,6 +77,7 @@ import io.grpc.xds.internal.headermutations.HeaderMutationRulesConfig;
 import io.grpc.xds.internal.headermutations.HeaderMutator;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.List;
 import java.util.Optional;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -98,6 +95,75 @@ import javax.annotation.Nullable;
  */
 final class ExternalProcessorClientInterceptor implements ClientInterceptor {
 
+  @VisibleForTesting
+  static DoubleHistogramMetricInstrument clientHeadersDuration;
+  @VisibleForTesting
+  static DoubleHistogramMetricInstrument clientHalfCloseDuration;
+  @VisibleForTesting
+  static DoubleHistogramMetricInstrument serverHeadersDuration;
+  @VisibleForTesting
+  static DoubleHistogramMetricInstrument serverTrailersDuration;
+
+  // Copied from io.grpc.opentelemetry.internal.OpenTelemetryConstants.LATENCY_BUCKETS
+  private static final List<Double> LATENCY_BUCKETS = ImmutableList.of(
+      0d,     0.00001d, 0.00005d, 0.0001d, 0.0003d, 0.0006d, 0.0008d, 0.001d, 0.002d,
+      0.003d, 0.004d,   0.005d,   0.006d,  0.008d,  0.01d,   0.013d,  0.016d, 0.02d,
+      0.025d, 0.03d,    0.04d,    0.05d,   0.065d,  0.08d,   0.1d,    0.13d,  0.16d,
+      0.2d,   0.25d,    0.3d,     0.4d,    0.5d,    0.65d,   0.8d,    1d,     2d,
+      5d,     10d,      20d,      50d,     100d);
+
+  static {
+    initMetricInstruments();
+  }
+
+  static synchronized void initMetricInstruments() {
+    if (io.grpc.internal.GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_CLIENT", false)) {
+      if (clientHeadersDuration == null) {
+        MetricInstrumentRegistry registry = MetricInstrumentRegistry.getDefaultRegistry();
+
+        clientHeadersDuration = registry.registerDoubleHistogram(
+            "grpc.client_ext_proc.client_headers_duration",
+            "Time between when the ext_proc filter sees the client's headers and when "
+                + "it allows those headers to continue on to the next filter",
+            "s",
+            LATENCY_BUCKETS,
+            ImmutableList.of("grpc.target"),
+            ImmutableList.of("grpc.lb.backend_service"),
+            true);
+
+        clientHalfCloseDuration = registry.registerDoubleHistogram(
+            "grpc.client_ext_proc.client_half_close_duration",
+            "Time between when the ext_proc filter sees the client's half-close and when "
+                + "it allows that half-close to continue on to the next filter",
+            "s",
+            LATENCY_BUCKETS,
+            ImmutableList.of("grpc.target"),
+            ImmutableList.of("grpc.lb.backend_service"),
+            true);
+
+        serverHeadersDuration = registry.registerDoubleHistogram(
+            "grpc.client_ext_proc.server_headers_duration",
+            "Time between when the ext_proc filter sees the server's headers and when "
+                + "it allows those headers to continue on to the next filter",
+            "s",
+            LATENCY_BUCKETS,
+            ImmutableList.of("grpc.target"),
+            ImmutableList.of("grpc.lb.backend_service"),
+            true);
+
+        serverTrailersDuration = registry.registerDoubleHistogram(
+            "grpc.client_ext_proc.server_trailers_duration",
+            "Time between when the ext_proc filter sees the server's trailers and when "
+                + "it allows those trailers to continue on to the next filter",
+            "s",
+            LATENCY_BUCKETS,
+            ImmutableList.of("grpc.target"),
+            ImmutableList.of("grpc.lb.backend_service"),
+            true);
+      }
+    }
+  }
+
   private final ExternalProcessorFilterConfig filterConfig;
   private final ScheduledExecutorService scheduler;
   private final MetricRecorder metricsRecorder;
@@ -112,7 +178,6 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
     checkNotNull(cachedChannelManager, "cachedChannelManager");
     this.scheduler = checkNotNull(scheduler, "scheduler");
     this.metricsRecorder = checkNotNull(context.metricsRecorder(), "metricsRecorder");
-    ExternalProcessorClientInterceptorMetricInstruments.initMetricInstruments();
     this.extProcChannel = cachedChannelManager.getChannel(filterConfig.getGrpcServiceConfig());
   }
 
