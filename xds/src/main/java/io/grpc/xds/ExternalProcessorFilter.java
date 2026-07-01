@@ -53,10 +53,6 @@ public class ExternalProcessorFilter implements Filter {
   static final String TYPE_URL = 
       "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor";
 
-
-
-
-
   private final CachedChannelManager cachedChannelManager;
   private final FilterContext context;
 

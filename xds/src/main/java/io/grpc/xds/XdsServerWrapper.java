@@ -611,10 +611,6 @@ final class XdsServerWrapper extends Server {
       Set<String> filtersToShutdown = new HashSet<>(chainFilters.keySet());
       for (NamedFilterConfig namedFilter : filterConfigs) {
         String typeUrl = namedFilter.filterConfig.typeUrl();
-        if (typeUrl.equals(ExternalProcessorFilter.TYPE_URL)
-            && !GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_SERVER", false)) {
-          continue;
-        }
         String filterKey = namedFilter.filterStateKey();
 
         Filter.Provider provider = filterRegistry.get(typeUrl);
@@ -693,9 +689,6 @@ final class XdsServerWrapper extends Server {
           for (NamedFilterConfig namedFilter : filterConfigs) {
             String typeUrl = namedFilter.filterConfig.typeUrl();
             if (typeUrl.equals(ExternalProcessorFilter.TYPE_URL)) {
-              if (!GrpcUtil.getFlag("GRPC_EXPERIMENTAL_XDS_EXT_PROC_ON_SERVER", false)) {
-                continue;
-              }
               hasExtProc = true;
             }
             String name = namedFilter.name;
@@ -913,6 +906,7 @@ final class XdsServerWrapper extends Server {
           }
         };
 
+    @SuppressWarnings("unchecked")
     @Override
     public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
         final ServerCall<ReqT, RespT> call, Metadata headers, ServerCallHandler<ReqT, RespT> next) {
