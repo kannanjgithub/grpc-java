@@ -14,14 +14,21 @@
  * limitations under the License.
  */
 
-package io.grpc.xds.internal.grpcservice;
+package io.grpc.xds.internal.extauthz;
 
 /**
- * Configuration for channel credentials.
+ * A custom exception for signaling errors during the parsing of external authorization
+ * (ext_authz) configurations.
  */
-public interface ChannelCredsConfig {
-  /**
-   * Returns the type of the credentials.
-   */
-  String type();
+public class ExtAuthzParseException extends Exception {
+
+  private static final long serialVersionUID = 0L;
+
+  public ExtAuthzParseException(String message) {
+    super(message);
+  }
+
+  public ExtAuthzParseException(String message, Throwable cause) {
+    super(message, cause);
+  }
 }

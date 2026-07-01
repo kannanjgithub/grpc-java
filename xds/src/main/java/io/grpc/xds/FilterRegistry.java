@@ -25,14 +25,14 @@ import javax.annotation.Nullable;
  * A registry for all supported {@link Filter}s. Filters can be queried from the registry
  * by any of the {@link Filter.Provider#typeUrls() type URLs}.
  */
-public final class FilterRegistry {
+final class FilterRegistry {
   private static FilterRegistry instance;
 
   private final Map<String, Filter.Provider> supportedFilters = new HashMap<>();
 
   private FilterRegistry() {}
 
-  public static synchronized FilterRegistry getDefaultRegistry() {
+  static synchronized FilterRegistry getDefaultRegistry() {
     if (instance == null) {
       instance = newRegistry().register(
               new FaultFilter.Provider(),
@@ -45,7 +45,7 @@ public final class FilterRegistry {
   }
 
   @VisibleForTesting
-  public static synchronized void reset() {
+  static synchronized void reset() {
     instance = null;
   }
 
@@ -65,7 +65,7 @@ public final class FilterRegistry {
   }
 
   @Nullable
-  public Filter.Provider get(String typeUrl) {
+  Filter.Provider get(String typeUrl) {
     return supportedFilters.get(typeUrl);
   }
 }
