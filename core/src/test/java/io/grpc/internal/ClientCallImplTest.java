@@ -33,6 +33,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
@@ -75,6 +76,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -1143,6 +1145,46 @@ public class ClientCallImplTest {
       while (!commands.isEmpty()) {
         commands.poll().run();
       }
+    }
+  }
+
+  @Test
+  public void messagesAvailable_executorRejection() throws Exception {
+    RejectingExecutor rejectingExecutor = new RejectingExecutor();
+    ClientCallImpl<Void, Void> call = new ClientCallImpl<>(
+        method,
+        rejectingExecutor,
+        baseCallOptions,
+        clientStreamProvider,
+        deadlineCancellationExecutor,
+        channelCallTracer, configSelector);
+    call.start(callListener, new Metadata());
+    verify(stream).start(listenerArgumentCaptor.capture());
+    final ClientStreamListener streamListener = listenerArgumentCaptor.getValue();
+
+    StreamListener.MessageProducer producer = mock(StreamListener.MessageProducer.class);
+    InputStream message = mock(InputStream.class);
+    when(producer.next()).thenReturn(message).thenReturn(null);
+
+    // Call messagesAvailable. The executor will reject the runnable,
+    // which should catch the RejectedExecutionException, close the message,
+    // and cancel the stream.
+    streamListener.messagesAvailable(producer);
+
+    // Verify that the producer's message was closed to release resources
+    verify(message).close();
+
+    // Verify that the stream was cancelled with a CANCELLED status containing the rejection cause
+    ArgumentCaptor<Status> statusCaptor = ArgumentCaptor.forClass(Status.class);
+    verify(stream).cancel(statusCaptor.capture());
+    assertEquals(Status.Code.CANCELLED, statusCaptor.getValue().getCode());
+    assertTrue(statusCaptor.getValue().getCause() instanceof RejectedExecutionException);
+  }
+
+  private static final class RejectingExecutor implements Executor {
+    @Override
+    public void execute(Runnable command) {
+      throw new RejectedExecutionException("rejected");
     }
   }
 }

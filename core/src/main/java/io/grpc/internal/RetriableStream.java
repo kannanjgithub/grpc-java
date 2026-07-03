@@ -1135,13 +1135,18 @@ abstract class RetriableStream<ReqT> implements ClientStream {
         GrpcUtil.closeQuietly(producer);
         return;
       }
-      listenerSerializeExecutor.execute(
-          new Runnable() {
-            @Override
-            public void run() {
-              masterListener.messagesAvailable(producer);
-            }
-          });
+      try {
+        listenerSerializeExecutor.execute(
+            new Runnable() {
+              @Override
+              public void run() {
+                masterListener.messagesAvailable(producer);
+              }
+            });
+      } catch (Throwable e) {
+        GrpcUtil.closeQuietly(producer);
+        throw e;
+      }
     }
 
     @Override

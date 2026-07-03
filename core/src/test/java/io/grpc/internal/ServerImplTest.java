@@ -96,6 +96,7 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -1893,6 +1894,78 @@ public class ServerImplTest {
         runnable = null;
         r.run();
       }
+    }
+  }
+
+  @Test
+  public void messagesAvailable_executorRejection() throws Exception {
+    final RejectingExecutor rejectingExecutor =
+        new RejectingExecutor(executor.getScheduledExecutorService());
+    when(executorPool.getObject()).thenReturn(rejectingExecutor);
+
+    final AtomicReference<ServerCall<String, Integer>> callReference = new AtomicReference<>();
+    mutableFallbackRegistry.addService(
+        ServerServiceDefinition.builder(new ServiceDescriptor("Waiter", METHOD))
+            .addMethod(
+                METHOD,
+                new ServerCallHandler<String, Integer>() {
+                  @Override
+                  public ServerCall.Listener<String> startCall(
+                      ServerCall<String, Integer> call, Metadata headers) {
+                    callReference.set(call);
+                    return callListener;
+                  }
+                })
+            .build());
+
+    createAndStartServer();
+    ServerTransportListener transportListener =
+        transportServer.registerNewServerTransport(new SimpleServerTransport());
+    transportListener.transportReady(Attributes.EMPTY);
+
+    Metadata requestHeaders = new Metadata();
+    StatsTraceContext statsTraceCtx =
+        StatsTraceContext.newServerContext(streamTracerFactories, "Waiter/serve", requestHeaders);
+    when(stream.statsTraceContext()).thenReturn(statsTraceCtx);
+
+    transportListener.streamCreated(stream, "Waiter/serve", requestHeaders);
+    verify(stream).setListener(streamListenerCaptor.capture());
+    ServerStreamListener streamListener = streamListenerCaptor.getValue();
+    assertNotNull(streamListener);
+
+    // Run setup tasks (MethodLookup, HandleServerCall)
+    assertEquals(1, executor.runDueTasks());
+    assertNotNull(callReference.get());
+
+    // Enable rejection
+    rejectingExecutor.reject = true;
+
+    StreamListener.MessageProducer producer = mock(StreamListener.MessageProducer.class);
+    InputStream message = mock(InputStream.class);
+    when(producer.next()).thenReturn(message).thenReturn(null);
+
+    // Call messagesAvailable and assert that it throws RejectedExecutionException
+    assertThrows(
+        RejectedExecutionException.class, () -> streamListener.messagesAvailable(producer));
+
+    // Verify that the message was closed (releasing ByteBufs)
+    verify(message).close();
+  }
+
+  private static final class RejectingExecutor implements Executor {
+    private final Executor delegate;
+    boolean reject = false;
+
+    RejectingExecutor(Executor delegate) {
+      this.delegate = delegate;
+    }
+
+    @Override
+    public void execute(Runnable command) {
+      if (reject) {
+        throw new RejectedExecutionException("rejected");
+      }
+      delegate.execute(command);
     }
   }
 }

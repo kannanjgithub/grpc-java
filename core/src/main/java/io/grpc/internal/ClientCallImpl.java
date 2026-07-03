@@ -58,6 +58,7 @@ import java.nio.charset.Charset;
 import java.util.Locale;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -674,7 +675,13 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
           }
         }
 
-        callExecutor.execute(new MessagesAvailable());
+        try {
+          callExecutor.execute(new MessagesAvailable());
+        } catch (RejectedExecutionException e) {
+          GrpcUtil.closeQuietly(producer);
+          exceptionThrown(
+              Status.CANCELLED.withCause(e).withDescription("Failed to read message."));
+        }
       }
     }
 

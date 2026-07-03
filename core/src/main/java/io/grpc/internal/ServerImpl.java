@@ -73,6 +73,7 @@ import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -857,7 +858,12 @@ public final class ServerImpl extends io.grpc.Server implements InternalInstrume
           }
         }
 
-        callExecutor.execute(new MessagesAvailable());
+        try {
+          callExecutor.execute(new MessagesAvailable());
+        } catch (RejectedExecutionException e) {
+          GrpcUtil.closeQuietly(producer);
+          throw e;
+        }
       }
     }
 

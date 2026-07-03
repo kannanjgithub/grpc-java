@@ -26,6 +26,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.AdditionalAnswers.delegatesTo;
 import static org.mockito.ArgumentMatchers.any;
@@ -33,6 +34,7 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -54,6 +56,7 @@ import io.grpc.MethodDescriptor;
 import io.grpc.MethodDescriptor.MethodType;
 import io.grpc.Status;
 import io.grpc.Status.Code;
+import io.grpc.StatusRuntimeException;
 import io.grpc.StringMarshaller;
 import io.grpc.internal.ClientStreamListener.RpcProgress;
 import io.grpc.internal.RetriableStream.ChannelBufferMeter;
@@ -67,6 +70,7 @@ import java.util.List;
 import java.util.Random;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -2991,5 +2995,38 @@ public class RetriableStreamTest {
         return null;
       }
     }
+  }
+
+  @Test
+  public void messagesAvailable_executorRejection() throws Exception {
+    ClientStream mockStream = mock(ClientStream.class);
+    doReturn(mockStream).when(retriableStreamRecorder).newSubstream(0);
+    retriableStream.start(masterListener);
+
+    ArgumentCaptor<ClientStreamListener> sublistenerCaptor =
+        ArgumentCaptor.forClass(ClientStreamListener.class);
+    verify(mockStream).start(sublistenerCaptor.capture());
+    ClientStreamListener sublistener = sublistenerCaptor.getValue();
+
+    // Transition state to committed/winningSubstream
+    sublistener.headersRead(new Metadata());
+    verify(retriableStreamRecorder).postCommit();
+
+    // Mock masterListener to throw RejectedExecutionException when messagesAvailable is called
+    doThrow(new RejectedExecutionException("rejected"))
+        .when(masterListener)
+        .messagesAvailable(any(StreamListener.MessageProducer.class));
+
+    StreamListener.MessageProducer producer = mock(StreamListener.MessageProducer.class);
+    InputStream message = mock(InputStream.class);
+    when(producer.next()).thenReturn(message).thenReturn(null);
+
+    // Call messagesAvailable and assert that it throws StatusRuntimeException
+    // (wrapped by SynchronizationContext)
+    assertThrows(
+        StatusRuntimeException.class, () -> sublistener.messagesAvailable(producer));
+
+    // Verify that the message was closed (releasing ByteBufs)
+    verify(message).close();
   }
 }
