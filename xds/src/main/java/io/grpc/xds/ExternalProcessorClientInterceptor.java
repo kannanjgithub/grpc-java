@@ -970,7 +970,7 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
             bodyMessageSentToExtProc.set(true);
             super.sendMessage(new KnownLengthInputStream(bodyByteString));
           } else {
-            if (bodyByteString.size() > downstreamToSidestreamWindow || !pendingRequestBodyMessages.isEmpty()) {
+            if (downstreamToSidestreamWindow <= 0 || !pendingRequestBodyMessages.isEmpty()) {
               pendingRequestBodyMessages.add(bodyByteString);
             } else {
               sendRequestBodyToExtProc(bodyByteString);
@@ -1376,7 +1376,7 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
             dataPlaneClientCall.getCallContext().run(
                 () -> delegate().onMessage(bodyByteString.newInput()));
           } else {
-            if (bodyByteString.size() > dataPlaneClientCall.upstreamToSidestreamWindow || !savedMessages.isEmpty()) {
+            if (dataPlaneClientCall.upstreamToSidestreamWindow <= 0 || !savedMessages.isEmpty()) {
               savedMessages.add(new KnownLengthInputStream(bodyByteString));
             } else {
               dataPlaneClientCall.upstreamToSidestreamWindow -= bodyByteString.size();
