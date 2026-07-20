@@ -9980,6 +9980,12 @@ public class ExternalProcessorClientInterceptorTest {
                     .build())
                 .build())
             .build())
+        .setProcessingMode(ProcessingMode.newBuilder()
+            .setRequestBodyMode(ProcessingMode.BodySendMode.GRPC)
+            .setResponseBodyMode(ProcessingMode.BodySendMode.GRPC)
+            .setResponseHeaderMode(ProcessingMode.HeaderSendMode.SEND)
+            .setResponseTrailerMode(ProcessingMode.HeaderSendMode.SEND)
+            .build())
         .setObservabilityMode(false)
         .build();
     ConfigOrError<ExternalProcessorFilterConfig> configOrError =
@@ -10004,6 +10010,22 @@ public class ExternalProcessorClientInterceptorTest {
                 sidecarActionLatch.countDown();
                 responseObserver.onNext(ProcessingResponse.newBuilder()
                     .setRequestHeaders(HeadersResponse.newBuilder().build())
+                    .build());
+              } else if (request.hasResponseHeaders()) {
+                responseObserver.onNext(ProcessingResponse.newBuilder()
+                    .setResponseHeaders(HeadersResponse.newBuilder().build())
+                    .build());
+              } else if (request.hasResponseBody()) {
+                responseObserver.onNext(ProcessingResponse.newBuilder()
+                    .setResponseBody(BodyResponse.newBuilder()
+                        .setResponse(CommonResponse.newBuilder()
+                            .setBodyMutation(BodyMutation.newBuilder()
+                                .setStreamedResponse(StreamedBodyResponse.newBuilder()
+                                    .setBody(request.getResponseBody().getBody())
+                                    .build())
+                                .build())
+                            .build())
+                        .build())
                     .build());
               }
             }).start();
@@ -10057,11 +10079,22 @@ public class ExternalProcessorClientInterceptorTest {
     ExternalProcessorClientInterceptor interceptor = new ExternalProcessorClientInterceptor(
         filterConfig, channelManager, scheduler, FAKE_CONTEXT);
 
+    final AtomicReference<StreamObserver<String>> dataPlaneResponseObserverRef = new AtomicReference<>();
     dataPlaneServiceRegistry.addService(ServerServiceDefinition.builder("test.TestService")
-        .addMethod(METHOD_SAY_HELLO, ServerCalls.asyncUnaryCall(
-            (request, responseObserver) -> {
-              responseObserver.onNext("Hello");
-              responseObserver.onCompleted();
+        .addMethod(METHOD_BIDI_STREAMING, ServerCalls.asyncBidiStreamingCall(
+            new ServerCalls.BidiStreamingMethod<String, String>() {
+              @Override
+              public StreamObserver<String> invoke(StreamObserver<String> responseObserver) {
+                dataPlaneResponseObserverRef.set(responseObserver);
+                return new StreamObserver<String>() {
+                  @Override
+                  public void onNext(String value) {}
+                  @Override
+                  public void onError(Throwable t) {}
+                  @Override
+                  public void onCompleted() {}
+                };
+              }
             }))
         .build());
 
@@ -10087,8 +10120,9 @@ public class ExternalProcessorClientInterceptorTest {
 
     CallOptions callOptions = DEFAULT_CALL_OPTIONS.withExecutor(MoreExecutors.directExecutor());
     ClientCall<String, String> proxyCall =
-        interceptCall(interceptor, METHOD_SAY_HELLO, callOptions, dataPlaneChannel);
+        interceptCall(interceptor, METHOD_BIDI_STREAMING, callOptions, dataPlaneChannel);
     proxyCall.start(new ClientCall.Listener<String>() {}, new Metadata());
+    proxyCall.request(1); // Bootstrap request for headers
 
     // Wait for activation
     assertThat(sidecarActionLatch.await(5, TimeUnit.SECONDS)).isTrue();
@@ -10101,18 +10135,60 @@ public class ExternalProcessorClientInterceptorTest {
     // Sidecar busy -> request(5) should be buffered
     sidecarReady.set(false);
     proxyCall.request(5);
-    assertThat(dataPlaneRequestCount.get()).isEqualTo(0);
+    assertThat(dataPlaneRequestCount.get()).isEqualTo(1); // Only the initial bootstrap request went through
 
-    // Sidecar becomes ready -> buffered requests should be drained
+    // Sidecar becomes ready -> buffered requests should start draining (pulling next message)
     sidecarReady.set(true);
     sidecarListenerRef.get().onReady();
-    
+
     long startTime2 = System.currentTimeMillis();
+    while (dataPlaneRequestCount.get() < 2 && System.currentTimeMillis() - startTime2 < 5000) {
+      fakeClock.forwardTime(1, TimeUnit.SECONDS);
+      Thread.sleep(10);
+    }
+    assertThat(dataPlaneRequestCount.get()).isEqualTo(2);
+
+    StreamObserver<String> upstreamResponseObserver = dataPlaneResponseObserverRef.get();
+    
+    // Server sends response headers (Dummy)
+    upstreamResponseObserver.onNext("Dummy for headers");
+    
+    startTime2 = System.currentTimeMillis();
+    while (dataPlaneRequestCount.get() < 3 && System.currentTimeMillis() - startTime2 < 5000) {
+      fakeClock.forwardTime(1, TimeUnit.SECONDS);
+      Thread.sleep(10);
+    }
+    assertThat(dataPlaneRequestCount.get()).isEqualTo(3);
+
+    // Server sends first data message -> pulls next
+    upstreamResponseObserver.onNext("Msg 1");
+
+    startTime2 = System.currentTimeMillis();
+    while (dataPlaneRequestCount.get() < 4 && System.currentTimeMillis() - startTime2 < 5000) {
+      fakeClock.forwardTime(1, TimeUnit.SECONDS);
+      Thread.sleep(10);
+    }
+    assertThat(dataPlaneRequestCount.get()).isEqualTo(4);
+
+    // Server sends second data message -> pulls next
+    upstreamResponseObserver.onNext("Msg 2");
+
+    startTime2 = System.currentTimeMillis();
     while (dataPlaneRequestCount.get() < 5 && System.currentTimeMillis() - startTime2 < 5000) {
       fakeClock.forwardTime(1, TimeUnit.SECONDS);
       Thread.sleep(10);
     }
     assertThat(dataPlaneRequestCount.get()).isEqualTo(5);
+
+    // Server sends third data message -> pulls next (which drains the final pending request)
+    upstreamResponseObserver.onNext("Msg 3");
+
+    startTime2 = System.currentTimeMillis();
+    while (dataPlaneRequestCount.get() < 6 && System.currentTimeMillis() - startTime2 < 5000) {
+      fakeClock.forwardTime(1, TimeUnit.SECONDS);
+      Thread.sleep(10);
+    }
+    assertThat(dataPlaneRequestCount.get()).isEqualTo(6);
 
     proxyCall.cancel("Cleanup", null);
     channelManager.close();
