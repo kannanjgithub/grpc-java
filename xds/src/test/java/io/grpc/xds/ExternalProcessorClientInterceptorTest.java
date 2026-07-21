@@ -10988,17 +10988,12 @@ public class ExternalProcessorClientInterceptorTest {
                   firstBodyLatch.countDown();
                 } else if (request.hasRequestBody()) {
                   if (firstBodyLatch.getCount() > 0) {
-                    // This is the first body (70000 bytes). Truncate to 40000 to fit return window (65536) and trigger update.
-                    ByteString bodyToSend = request.getRequestBody().getBody();
-                    if (bodyToSend.size() == 70000) {
-                      bodyToSend = bodyToSend.substring(0, 40000);
-                    }
                     responseObserver.onNext(ProcessingResponse.newBuilder()
                         .setRequestBody(BodyResponse.newBuilder()
                             .setResponse(CommonResponse.newBuilder()
                                 .setBodyMutation(BodyMutation.newBuilder()
                                     .setStreamedResponse(StreamedBodyResponse.newBuilder()
-                                        .setBody(bodyToSend)
+                                        .setBody(request.getRequestBody().getBody())
                                         .build())
                                     .build())
                                 .build())
@@ -11117,7 +11112,7 @@ public class ExternalProcessorClientInterceptorTest {
     assertThat(proxyCall.isReady()).isTrue();
 
     // Verify both messages reached the backend service
-    assertThat(dataPlaneReceivedMessages).containsExactly(largeMessage70k.substring(0, 40000), largeMessage30k).inOrder();
+    assertThat(dataPlaneReceivedMessages).containsExactly(largeMessage70k, largeMessage30k).inOrder();
 
     proxyCall.cancel("Cleanup", null);
     channelManager.close();
@@ -11187,9 +11182,7 @@ public class ExternalProcessorClientInterceptorTest {
                 } else if (request.hasResponseBody()) {
                   com.google.protobuf.ByteString originalBody = request.getResponseBody().getBody();
                   com.google.protobuf.ByteString bodyToSend = originalBody;
-                  if (originalBody.size() == 70000) {
-                    bodyToSend = bodyToSend.substring(0, 40000);
-                  }
+                  // Return the original 70,000 bytes as-is
                   responseObserver.onNext(ProcessingResponse.newBuilder()
                       .setResponseBody(BodyResponse.newBuilder()
                           .setResponse(CommonResponse.newBuilder()
@@ -11334,7 +11327,7 @@ public class ExternalProcessorClientInterceptorTest {
     assertThat(configOrError.errorDetail).isNull();
     ExternalProcessorFilterConfig filterConfig = configOrError.config;
 
-    final String mutatedMessageTooLarge = new String(new char[70000]).replace('\0', 'd');
+    final String mutatedMessage = new String(new char[10000]).replace('\0', 'd');
     final CountDownLatch callClosedLatch = new CountDownLatch(1);
     final AtomicReference<Status> capturedStatus = new AtomicReference<>();
 
@@ -11368,13 +11361,12 @@ public class ExternalProcessorClientInterceptorTest {
                       .setResponseHeaders(HeadersResponse.newBuilder().build())
                       .build());
                 } else if (request.hasResponseBody()) {
-                  // Respond with a mutated body that is larger than the initial window size of 65536
                   responseObserver.onNext(ProcessingResponse.newBuilder()
                       .setResponseBody(BodyResponse.newBuilder()
                           .setResponse(CommonResponse.newBuilder()
                               .setBodyMutation(BodyMutation.newBuilder()
                                   .setStreamedResponse(StreamedBodyResponse.newBuilder()
-                                      .setBody(ByteString.copyFromUtf8(mutatedMessageTooLarge))
+                                      .setBody(ByteString.copyFromUtf8(mutatedMessage))
                                       .build())
                                   .build())
                               .build())
@@ -11444,11 +11436,18 @@ public class ExternalProcessorClientInterceptorTest {
 
     proxyCall.sendMessage("Client Msg");
 
+    // Retrieve the DataPlaneClientCall and set the sidestreamToDownstreamWindow to 0 via reflection
+    Object dataPlaneCall = unwrapToDataPlaneClientCall(proxyCall);
+    java.lang.reflect.Field windowField = dataPlaneCall.getClass().getDeclaredField("sidestreamToDownstreamWindow");
+    windowField.setAccessible(true);
+    windowField.setLong(dataPlaneCall, 0);
+
     // Send a response from upstream to trigger headers and then the body response
     StreamObserver<String> upstreamResponseObserver = dataPlaneResponseObserverRef.get();
     upstreamResponseObserver.onNext("Response Msg");
 
     assertThat(callClosedLatch.await(5, TimeUnit.SECONDS)).isTrue();
+
     // The call should fail immediately with INTERNAL error code due to flow control violation
     assertThat(capturedStatus.get().getCode()).isEqualTo(Status.Code.INTERNAL);
     assertThat(capturedStatus.get().getDescription()).isEqualTo("External processor stream failed");
@@ -11482,7 +11481,7 @@ public class ExternalProcessorClientInterceptorTest {
     assertThat(configOrError.errorDetail).isNull();
     ExternalProcessorFilterConfig filterConfig = configOrError.config;
 
-    final String mutatedMessageTooLarge = new String(new char[70000]).replace('\0', 'c');
+    final String mutatedMessage = new String(new char[10000]).replace('\0', 'c');
     final CountDownLatch callClosedLatch = new CountDownLatch(1);
     final AtomicReference<Status> capturedStatus = new AtomicReference<>();
 
@@ -11500,13 +11499,12 @@ public class ExternalProcessorClientInterceptorTest {
                       .setRequestHeaders(HeadersResponse.newBuilder().build())
                       .build());
                 } else if (request.hasRequestBody()) {
-                  // Respond with a mutated body that is larger than the initial window size of 65536
                   responseObserver.onNext(ProcessingResponse.newBuilder()
                       .setRequestBody(BodyResponse.newBuilder()
                           .setResponse(CommonResponse.newBuilder()
                               .setBodyMutation(BodyMutation.newBuilder()
                                   .setStreamedResponse(StreamedBodyResponse.newBuilder()
-                                      .setBody(ByteString.copyFromUtf8(mutatedMessageTooLarge))
+                                      .setBody(ByteString.copyFromUtf8(mutatedMessage))
                                       .build())
                                   .build())
                               .build())
@@ -11562,9 +11560,16 @@ public class ExternalProcessorClientInterceptorTest {
       }
     }, new Metadata());
 
+    // Retrieve the DataPlaneClientCall and set the sidestreamToUpstreamWindow to 0 via reflection
+    Object dataPlaneCall = unwrapToDataPlaneClientCall(proxyCall);
+    java.lang.reflect.Field windowField = dataPlaneCall.getClass().getDeclaredField("sidestreamToUpstreamWindow");
+    windowField.setAccessible(true);
+    windowField.setLong(dataPlaneCall, 0);
+
     proxyCall.sendMessage("Message 1");
 
     assertThat(callClosedLatch.await(5, TimeUnit.SECONDS)).isTrue();
+
     // The call should fail immediately with INTERNAL error code due to flow control violation
     assertThat(capturedStatus.get().getCode()).isEqualTo(Status.Code.INTERNAL);
     assertThat(capturedStatus.get().getDescription()).isEqualTo("External processor stream failed");
@@ -12599,6 +12604,155 @@ public class ExternalProcessorClientInterceptorTest {
     assertThat(receivedRequests).hasSize(5);
     assertThat(receivedRequests.get(4).hasClientWindowUpdate()).isTrue();
     assertThat(receivedRequests.get(4).getClientWindowUpdate().getWindowIncrementSidestreamToDownstream()).isEqualTo(40000);
+
+    proxyCall.cancel("Cleanup", null);
+    channelManager.close();
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
+  public void testClientWindowUpdateSentImmediatelyWhenSidestreamToUpstreamWindowExhaustedEvenIfClientCallNotReady() throws Exception {
+    ExternalProcessor proto = ExternalProcessor.newBuilder()
+        .setGrpcService(GrpcService.newBuilder()
+            .setGoogleGrpc(GrpcService.GoogleGrpc.newBuilder()
+                .setTargetUri("in-process:///" + extProcServerName)
+                .addChannelCredentialsPlugin(Any.newBuilder()
+                    .setTypeUrl("type.googleapis.com/envoy.extensions.grpc_service.channel_credentials.insecure.v3.InsecureCredentials")
+                    .build())
+                .build())
+            .build())
+        .setProcessingMode(ProcessingMode.newBuilder()
+            .setRequestBodyMode(ProcessingMode.BodySendMode.GRPC)
+            .setResponseBodyMode(ProcessingMode.BodySendMode.GRPC)
+            .setResponseHeaderMode(ProcessingMode.HeaderSendMode.SEND)
+            .setResponseTrailerMode(ProcessingMode.HeaderSendMode.SEND)
+            .build())
+        .build();
+    ConfigOrError<ExternalProcessorFilterConfig> configOrError =
+        provider.parseFilterConfig(Any.pack(proto), filterContext);
+    assertThat(configOrError.errorDetail).isNull();
+    ExternalProcessorFilterConfig filterConfig = configOrError.config;
+
+    final List<ProcessingRequest> receivedRequests = new CopyOnWriteArrayList<>();
+    final CountDownLatch extProcLatch = new CountDownLatch(2); // Headers + Request Body
+    final AtomicReference<StreamObserver<ProcessingResponse>> responseObserverRef = new AtomicReference<>();
+
+    ExternalProcessorGrpc.ExternalProcessorImplBase extProcImpl =
+        new ExternalProcessorGrpc.ExternalProcessorImplBase() {
+          @Override
+          public StreamObserver<ProcessingRequest> process(
+              final StreamObserver<ProcessingResponse> responseObserver) {
+            responseObserverRef.set(responseObserver);
+            ((ServerCallStreamObserver<ProcessingResponse>) responseObserver).request(100);
+            return new StreamObserver<ProcessingRequest>() {
+              @Override
+              public void onNext(ProcessingRequest request) {
+                receivedRequests.add(request);
+                if (request.hasRequestHeaders()) {
+                  extProcLatch.countDown();
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setRequestHeaders(HeadersResponse.newBuilder().build())
+                      .build());
+                } else if (request.hasRequestBody()) {
+                  extProcLatch.countDown();
+                  // Mutate request body and send back 65536 bytes. This completely exhausts the return window (starts at 65536).
+                  responseObserver.onNext(ProcessingResponse.newBuilder()
+                      .setRequestBody(BodyResponse.newBuilder()
+                          .setResponse(CommonResponse.newBuilder()
+                              .setBodyMutation(BodyMutation.newBuilder()
+                                  .setStreamedResponse(StreamedBodyResponse.newBuilder()
+                                      .setBody(ByteString.copyFrom(new byte[65536]))
+                                      .build())
+                                  .build())
+                              .build())
+                          .build())
+                      .build());
+                }
+              }
+
+              @Override
+              public void onError(Throwable t) {}
+
+              @Override
+              public void onCompleted() {
+                responseObserver.onCompleted();
+              }
+            };
+          }
+        };
+
+    String uniqueExtProcServerName = InProcessServerBuilder.generateName();
+    grpcCleanup.register(InProcessServerBuilder.forName(uniqueExtProcServerName)
+        .addService(extProcImpl)
+        .directExecutor()
+        .build().start());
+
+    CachedChannelManager channelManager = new CachedChannelManager(config -> {
+      return grpcCleanup.register(
+          InProcessChannelBuilder.forName(uniqueExtProcServerName).directExecutor().build());
+    });
+
+    ExternalProcessorClientInterceptor interceptor = new ExternalProcessorClientInterceptor(
+        filterConfig, channelManager, scheduler, FAKE_CONTEXT);
+
+    dataPlaneServiceRegistry.addService(ServerServiceDefinition.builder("test.TestService")
+        .addMethod(METHOD_CLIENT_STREAMING, ServerCalls.asyncClientStreamingCall(
+            new ServerCalls.ClientStreamingMethod<String, String>() {
+              @Override
+              public StreamObserver<String> invoke(StreamObserver<String> responseObserver) {
+                return new StreamObserver<String>() {
+                  @Override
+                  public void onNext(String value) {}
+                  @Override
+                  public void onError(Throwable t) {}
+                  @Override
+                  public void onCompleted() {
+                    responseObserver.onNext("Response");
+                    responseObserver.onCompleted();
+                  }
+                };
+              }
+            }))
+        .build());
+
+    ManagedChannel dataPlaneChannel = grpcCleanup.register(
+        InProcessChannelBuilder.forName(dataPlaneServerName)
+            .intercept(new ClientInterceptor() {
+              @Override
+              public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
+                  MethodDescriptor<ReqT, RespT> method, CallOptions callOptions, Channel next) {
+                return new io.grpc.ForwardingClientCall.SimpleForwardingClientCall<ReqT, RespT>(
+                    next.newCall(method, callOptions)) {
+                  @Override
+                  public boolean isReady() {
+                    return false; // Force client call to be not ready
+                  }
+                };
+              }
+            })
+            .directExecutor()
+            .build());
+
+    ClientCall<String, String> proxyCall =
+        interceptCall(interceptor, METHOD_CLIENT_STREAMING, DEFAULT_CALL_OPTIONS.withExecutor(MoreExecutors.directExecutor()), dataPlaneChannel);
+
+    proxyCall.start(new ClientCall.Listener<String>() {}, new Metadata());
+
+    // Send 10k message to ext_proc.
+    String body10k = new String(new char[10000]).replace('\0', 'a');
+    proxyCall.sendMessage(body10k);
+
+    assertThat(extProcLatch.await(5, TimeUnit.SECONDS)).isTrue();
+
+    // Since the window is exhausted (65536 bytes returned from sidecar), the ClientWindowUpdate
+    // should be sent immediately even though the client call is not ready (isReady() == false).
+    long startTime = System.currentTimeMillis();
+    while (receivedRequests.size() < 3 && System.currentTimeMillis() - startTime < 5000) {
+      Thread.sleep(10);
+    }
+    assertThat(receivedRequests).hasSize(3);
+    assertThat(receivedRequests.get(2).hasClientWindowUpdate()).isTrue();
+    assertThat(receivedRequests.get(2).getClientWindowUpdate().getWindowIncrementSidestreamToUpstream()).isEqualTo(65536);
 
     proxyCall.cancel("Cleanup", null);
     channelManager.close();
@@ -17182,4 +17336,40 @@ public class ExternalProcessorClientInterceptorTest {
       Thread.currentThread().interrupt();
     }
   }
+
+  private static Object unwrapToDataPlaneClientCall(ClientCall<?, ?> call) throws Exception {
+    ClientCall<?, ?> current = call;
+    while (current != null) {
+      if (current.getClass().getName().equals("io.grpc.xds.ExternalProcessorClientInterceptor$DataPlaneClientCall")) {
+        return current;
+      }
+      java.lang.reflect.Field delegateField = null;
+      Class<?> c = current.getClass();
+      while (c != null) {
+        try {
+          delegateField = c.getDeclaredField("delegate");
+          break;
+        } catch (NoSuchFieldException e) {
+          try {
+            delegateField = c.getDeclaredField("val$rawCall");
+            break;
+          } catch (NoSuchFieldException e2) {
+            c = c.getSuperclass();
+          }
+        }
+      }
+      if (delegateField == null) {
+        try {
+          java.lang.reflect.Method getDelegateMethod = current.getClass().getMethod("delegate");
+          current = (ClientCall<?, ?>) getDelegateMethod.invoke(current);
+          continue;
+        } catch (Throwable ignored) {}
+        throw new IllegalArgumentException("Could not find delegate or val$rawCall field in " + current.getClass().getName());
+      }
+      delegateField.setAccessible(true);
+      current = (ClientCall<?, ?>) delegateField.get(current);
+    }
+    throw new IllegalArgumentException("Could not unwrap to DataPlaneClientCall: " + call);
+  }
 }
+

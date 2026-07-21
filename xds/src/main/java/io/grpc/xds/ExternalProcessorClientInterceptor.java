@@ -765,14 +765,14 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
         if (extProcStreamState.get().isCompleted()) {
           return;
         }
-        long incrementUpstream = (super.isReady() || sidestreamToUpstreamWindow < 0)
+        long incrementUpstream = (super.isReady() || sidestreamToUpstreamWindow <= 0)
             ? accumulatedWindowUpdateSidestreamToUpstream : 0;
         long incrementDownstream = accumulatedWindowUpdateSidestreamToDownstream;
 
         boolean shouldSend = (incrementUpstream >= WINDOW_UPDATE_THRESHOLD)
             || (incrementDownstream >= WINDOW_UPDATE_THRESHOLD)
-            || (sidestreamToUpstreamWindow < 0 && accumulatedWindowUpdateSidestreamToUpstream > 0)
-            || (sidestreamToDownstreamWindow < 0 && accumulatedWindowUpdateSidestreamToDownstream > 0);
+            || (sidestreamToUpstreamWindow <= 0 && accumulatedWindowUpdateSidestreamToUpstream > 0)
+            || (sidestreamToDownstreamWindow <= 0 && accumulatedWindowUpdateSidestreamToDownstream > 0);
 
         if (shouldSend) {
           accumulatedWindowUpdateSidestreamToUpstream -= incrementUpstream;
@@ -1086,7 +1086,7 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
             com.google.protobuf.ByteString body = streamed.getBody();
             if (!config.getObservabilityMode() && currentProcessingMode.getRequestBodyMode() == ProcessingMode.BodySendMode.GRPC) {
               synchronized (streamLock) {
-                if (body.size() > sidestreamToUpstreamWindow) {
+                if (sidestreamToUpstreamWindow <= 0) {
                   internalOnError(Status.INTERNAL
                       .withDescription("Flow control violation: received client body from ext_proc when window is closed")
                       .asRuntimeException());
@@ -1120,7 +1120,7 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
           final int bodySize = body.size();
           if (!config.getObservabilityMode() && currentProcessingMode.getResponseBodyMode() == ProcessingMode.BodySendMode.GRPC) {
             synchronized (streamLock) {
-              if (bodySize > sidestreamToDownstreamWindow) {
+              if (sidestreamToDownstreamWindow <= 0) {
                 internalOnError(Status.INTERNAL
                     .withDescription("Flow control violation: received server body from ext_proc when window is closed")
                     .asRuntimeException());
