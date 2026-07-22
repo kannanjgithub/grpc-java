@@ -311,7 +311,13 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
     private long sidestreamToDownstreamWindow = DEFAULT_INITIAL_WINDOW_SIZE;
 
     // Buffered request body messages from downstream
-    private final Queue<ByteString> pendingRequestBodyMessages = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    private final Queue<ByteString> pendingRequestBodyMessages =
+        new java.util.concurrent.ConcurrentLinkedQueue<>();
+
+    // Buffered mutated response bodies from sidecar
+    private int downstreamRequestsPending = 0;
+    private final Queue<ByteString> pendingMutatedResponseBodies =
+        new java.util.concurrent.ConcurrentLinkedQueue<>();
 
     private static final long WINDOW_UPDATE_THRESHOLD = DEFAULT_INITIAL_WINDOW_SIZE / 2;
 
@@ -737,7 +743,7 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
 
     void mergeAccumulatedWindowUpdates(ProcessingRequest.Builder requestBuilder) {
       synchronized (streamLock) {
-        long incrementUpstream = (super.isReady() || sidestreamToUpstreamWindow < 0)
+        long incrementUpstream = super.isReady()
             ? accumulatedWindowUpdateSidestreamToUpstream : 0;
         long incrementDownstream = accumulatedWindowUpdateSidestreamToDownstream;
 
@@ -757,22 +763,20 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
 
     private void trySendAccumulatedWindowUpdates() {
       synchronized (streamLock) {
-        System.out.println("trySendAccumulatedWindowUpdates: completed=" + extProcStreamState.get().isCompleted() +
-                           ", super.isReady()=" + super.isReady() +
-                           ", sidestreamToUpstreamWindow=" + sidestreamToUpstreamWindow +
-                           ", accumulatedUpstream=" + accumulatedWindowUpdateSidestreamToUpstream +
-                           ", accumulatedDownstream=" + accumulatedWindowUpdateSidestreamToDownstream);
         if (extProcStreamState.get().isCompleted()) {
           return;
         }
-        long incrementUpstream = (super.isReady() || sidestreamToUpstreamWindow <= 0)
+        long incrementUpstream = super.isReady()
             ? accumulatedWindowUpdateSidestreamToUpstream : 0;
         long incrementDownstream = accumulatedWindowUpdateSidestreamToDownstream;
 
-        boolean shouldSend = (incrementUpstream >= WINDOW_UPDATE_THRESHOLD)
+        boolean shouldSend = (incrementUpstream > 0 || incrementDownstream > 0) && (
+            (incrementUpstream >= WINDOW_UPDATE_THRESHOLD)
             || (incrementDownstream >= WINDOW_UPDATE_THRESHOLD)
             || (sidestreamToUpstreamWindow <= 0 && accumulatedWindowUpdateSidestreamToUpstream > 0)
-            || (sidestreamToDownstreamWindow <= 0 && accumulatedWindowUpdateSidestreamToDownstream > 0);
+            || (sidestreamToDownstreamWindow <= 0
+                && accumulatedWindowUpdateSidestreamToDownstream > 0)
+        );
 
         if (shouldSend) {
           accumulatedWindowUpdateSidestreamToUpstream -= incrementUpstream;
@@ -889,7 +893,8 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
         if (config.getObservabilityMode()) {
           return super.isReady() && sidecarReady;
         }
-        return downstreamToSidestreamWindow > 0 && sidecarReady && pendingRequestBodyMessages.isEmpty();
+        return downstreamToSidestreamWindow > 0 && sidecarReady
+            && pendingRequestBodyMessages.isEmpty();
       }
     }
 
@@ -904,10 +909,6 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
         super.request(numMessages);
         return;
       }
-      if (!isSidecarReady()) {
-        pendingRequests.addAndGet(numMessages);
-        return;
-      }
       if (config.getObservabilityMode() 
           || currentProcessingMode.getResponseBodyMode() != ProcessingMode.BodySendMode.GRPC) {
         super.request(numMessages);
@@ -915,7 +916,11 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
       }
       synchronized (streamLock) {
         pendingRequests.addAndGet(numMessages);
-        drainPendingRequests();
+        downstreamRequestsPending += numMessages;
+        if (isSidecarReady()) {
+          drainPendingMutatedResponseBodies();
+          drainPendingRequests();
+        }
       }
     }
 
@@ -1019,10 +1024,6 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
 
     @Override
     public void halfClose() {
-      System.out.println("halfClose: passThrough=" + passThroughMode.get() +
-                         ", extProcStreamCompleted=" + extProcStreamState.get().isCompleted() +
-                         ", extProcStreamDraining=" + extProcStreamState.get().isDraining() +
-                         ", bodyMode=" + currentProcessingMode.getRequestBodyMode());
       clientHalfCloseStartNanos = System.nanoTime();
       if (passThroughMode.get()) {
         if (requestSideClosed.compareAndSet(false, true)) {
@@ -1084,11 +1085,14 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
           StreamedBodyResponse streamed = mutation.getStreamedResponse();
           if (!streamed.getEndOfStreamWithoutMessage()) {
             com.google.protobuf.ByteString body = streamed.getBody();
-            if (!config.getObservabilityMode() && currentProcessingMode.getRequestBodyMode() == ProcessingMode.BodySendMode.GRPC) {
+            if (!config.getObservabilityMode()
+                && currentProcessingMode.getRequestBodyMode() == ProcessingMode.BodySendMode.GRPC) {
               synchronized (streamLock) {
                 if (sidestreamToUpstreamWindow <= 0) {
                   internalOnError(Status.INTERNAL
-                      .withDescription("Flow control violation: received client body from ext_proc when window is closed")
+                      .withDescription(
+                          "Flow control violation: received client body from ext_proc "
+                          + "when window is closed")
                       .asRuntimeException());
                   return;
                 }
@@ -1097,7 +1101,8 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
               }
             }
             super.sendMessage(new KnownLengthInputStream(body));
-            if (!config.getObservabilityMode() && currentProcessingMode.getRequestBodyMode() == ProcessingMode.BodySendMode.GRPC) {
+            if (!config.getObservabilityMode()
+                && currentProcessingMode.getRequestBodyMode() == ProcessingMode.BodySendMode.GRPC) {
               trySendAccumulatedWindowUpdates();
             }
           }
@@ -1118,29 +1123,74 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
           StreamedBodyResponse streamed = mutation.getStreamedResponse();
           com.google.protobuf.ByteString body = streamed.getBody();
           final int bodySize = body.size();
-          if (!config.getObservabilityMode() && currentProcessingMode.getResponseBodyMode() == ProcessingMode.BodySendMode.GRPC) {
+          if (!config.getObservabilityMode()
+              && currentProcessingMode.getResponseBodyMode() == ProcessingMode.BodySendMode.GRPC) {
             synchronized (streamLock) {
               if (sidestreamToDownstreamWindow <= 0) {
                 internalOnError(Status.INTERNAL
-                    .withDescription("Flow control violation: received server body from ext_proc when window is closed")
+                    .withDescription(
+                        "Flow control violation: received server body from ext_proc "
+                        + "when window is closed")
                     .asRuntimeException());
                 return;
               }
               sidestreamToDownstreamWindow -= bodySize;
             }
           }
+          deliverResponseBody(body, listener);
+        }
+      }
+    }
+
+    private void deliverResponseBody(ByteString body, DataPlaneListener listener) {
+      synchronized (streamLock) {
+        if (config.getObservabilityMode() 
+            || currentProcessingMode.getResponseBodyMode() != ProcessingMode.BodySendMode.GRPC) {
+          callContext.run(() -> listener.onExternalBody(body));
+          return;
+        }
+
+        if (downstreamRequestsPending > 0) {
+          downstreamRequestsPending--;
+          final int bodySize = body.size();
           callContext.run(() -> {
             try {
               listener.onExternalBody(body);
             } finally {
-              if (!config.getObservabilityMode() && currentProcessingMode.getResponseBodyMode() == ProcessingMode.BodySendMode.GRPC) {
+              synchronized (streamLock) {
+                accumulatedWindowUpdateSidestreamToDownstream += bodySize;
+              }
+              trySendAccumulatedWindowUpdates();
+            }
+          });
+        } else {
+          pendingMutatedResponseBodies.add(body);
+        }
+      }
+    }
+
+    private void drainPendingMutatedResponseBodies() {
+      synchronized (streamLock) {
+        while (downstreamRequestsPending > 0 && !pendingMutatedResponseBodies.isEmpty()) {
+          ByteString body = pendingMutatedResponseBodies.poll();
+          downstreamRequestsPending--;
+          if (pendingRequests.get() > 0) {
+            pendingRequests.decrementAndGet();
+          }
+          final int bodySize = body.size();
+          final DataPlaneListener listener = wrappedListener;
+          if (listener != null) {
+            callContext.run(() -> {
+              try {
+                listener.onExternalBody(body);
+              } finally {
                 synchronized (streamLock) {
                   accumulatedWindowUpdateSidestreamToDownstream += bodySize;
                 }
                 trySendAccumulatedWindowUpdates();
               }
-            }
-          });
+            });
+          }
         }
       }
     }
