@@ -130,6 +130,18 @@ tasks.register("runInteropTestRemote") {
         def result1 = client.newCall(request).execute()
         def result2 = client.newCall(request).execute()
         if (result1.code() != 200 || result2.code() != 200) {
+            project.println("result1 code: " + result1.code())
+            try {
+                project.println("result1 body: " + result1.body().string())
+            } catch (Exception e) {
+                project.println("Failed to read result1 body: " + e)
+            }
+            project.println("result2 code: " + result2.code())
+            try {
+                project.println("result2 body: " + result2.body().string())
+            } catch (Exception e) {
+                project.println("Failed to read result2 body: " + e)
+            }
             throw new GradleException("Unable to reuse same channel across requests")
         }
 
