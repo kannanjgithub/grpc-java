@@ -80,6 +80,7 @@ import io.grpc.CompositeChannelCredentials;
 import io.grpc.ConnectivityState;
 import io.grpc.ConnectivityStateInfo;
 import io.grpc.Context;
+import io.grpc.Deadline;
 import io.grpc.EquivalentAddressGroup;
 import io.grpc.InsecureChannelCredentials;
 import io.grpc.IntegerMarshaller;
@@ -3506,6 +3507,71 @@ public class ManagedChannelImplTest {
     assertTrue(
         "channel.isTerminated() is expected to be true but was false",
         channel.isTerminated());
+  }
+
+  @Test
+  public void retryPerAttemptTimeout() {
+    Map<String, Object> retryPolicy = new HashMap<>();
+    retryPolicy.put("maxAttempts", 3D);
+    retryPolicy.put("initialBackoff", "10s");
+    retryPolicy.put("maxBackoff", "30s");
+    retryPolicy.put("backoffMultiplier", 2D);
+    retryPolicy.put("retryableStatusCodes", Arrays.<Object>asList("UNAVAILABLE", "DEADLINE_EXCEEDED"));
+    retryPolicy.put("perAttemptRecvTimeout", "5s");
+    Map<String, Object> methodConfig = new HashMap<>();
+    Map<String, Object> name = new HashMap<>();
+    name.put("service", "service");
+    methodConfig.put("name", Arrays.<Object>asList(name));
+    methodConfig.put("retryPolicy", retryPolicy);
+    Map<String, Object> rawServiceConfig = new HashMap<>();
+    rawServiceConfig.put("methodConfig", Arrays.<Object>asList(methodConfig));
+
+    FakeNameResolverFactory nameResolverFactory =
+        new FakeNameResolverFactory.Builder(expectedUri)
+            .setServers(Collections.singletonList(new EquivalentAddressGroup(socketAddress)))
+            .build();
+    ManagedChannelServiceConfig managedChannelServiceConfig =
+        createManagedChannelServiceConfig(rawServiceConfig, null);
+    nameResolverFactory.nextConfigOrError.set(
+        ConfigOrError.fromConfig(managedChannelServiceConfig));
+
+    channelBuilder.nameResolverFactory(nameResolverFactory);
+    channelBuilder.executor(MoreExecutors.directExecutor());
+    channelBuilder.enableRetry();
+
+    requestConnection = false;
+    createChannel();
+
+    ClientCall<String, Integer> call = channel.newCall(method, CallOptions.DEFAULT);
+    call.start(mockCallListener, new Metadata());
+    ArgumentCaptor<Helper> helperCaptor = ArgumentCaptor.forClass(Helper.class);
+    verify(mockLoadBalancerProvider).newLoadBalancer(helperCaptor.capture());
+    helper = helperCaptor.getValue();
+    verify(mockLoadBalancer).acceptResolvedAddresses(resolvedAddressCaptor.capture());
+
+    Subchannel subchannel =
+        createSubchannelSafely(helper, addressGroup, Attributes.EMPTY, subchannelStateListener);
+    when(mockPicker.pickSubchannel(any(PickSubchannelArgs.class)))
+        .thenReturn(PickResult.withSubchannel(subchannel));
+    requestConnectionSafely(helper, subchannel);
+    MockClientTransportInfo transportInfo = transports.poll();
+    ConnectionClientTransport mockTransport = transportInfo.transport;
+    ClientStream mockStream = mock(ClientStream.class);
+
+    when(mockTransport.newStream(
+            same(method), any(Metadata.class), any(CallOptions.class),
+            ArgumentMatchers.<ClientStreamTracer[]>any()))
+        .thenReturn(mockStream);
+    transportInfo.listener.transportReady();
+    updateBalancingStateSafely(helper, READY, mockPicker);
+
+    executor.runDueTasks();
+
+    ArgumentCaptor<Deadline> deadlineCaptor = ArgumentCaptor.forClass(Deadline.class);
+    verify(mockStream).setDeadline(deadlineCaptor.capture());
+    long remaining = deadlineCaptor.getValue().timeRemaining(TimeUnit.MILLISECONDS);
+    assertThat(remaining).isAtLeast(4000L);
+    assertThat(remaining).isAtMost(6000L);
   }
 
   @Test

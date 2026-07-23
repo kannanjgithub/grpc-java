@@ -47,6 +47,7 @@ import com.google.common.collect.Iterables;
 import com.google.common.util.concurrent.MoreExecutors;
 import io.grpc.ClientStreamTracer;
 import io.grpc.Codec;
+import io.grpc.Deadline;
 import io.grpc.Compressor;
 import io.grpc.DecompressorRegistry;
 import io.grpc.Metadata;
@@ -2961,6 +2962,55 @@ public class RetriableStreamTest {
     verify(masterListener).closed(any(Status.class), any(RpcProgress.class), any(Metadata.class));
     verifyNoInteractions(mockStream3);
     assertEquals(0, fakeClock.numPendingTasks());
+  }
+
+  @Test
+  public void perAttemptTimeout_deadlineSetOnSubstream() {
+    long perAttemptTimeoutNanos = TimeUnit.SECONDS.toNanos(5);
+    RetryPolicy retryPolicy = new RetryPolicy(
+        3,
+        TimeUnit.SECONDS.toNanos(1),
+        TimeUnit.SECONDS.toNanos(2),
+        2D,
+        perAttemptTimeoutNanos,
+        ImmutableSet.of(Code.UNAVAILABLE, Code.DEADLINE_EXCEEDED));
+
+    // Case 1: Overall deadline is longer than per-attempt timeout (15s > 5s)
+    RetriableStream<String> stream = new RecordedRetriableStream(
+        method, new Metadata(), channelBufferUsed, PER_RPC_BUFFER_LIMIT, CHANNEL_BUFFER_LIMIT,
+        MoreExecutors.directExecutor(), fakeClock.getScheduledExecutorService(),
+        retryPolicy, null, null);
+
+    ClientStream mockStream1 = mock(ClientStream.class);
+    doReturn(mockStream1).when(retriableStreamRecorder).newSubstream(0);
+
+    Deadline overallDeadline = Deadline.after(15, TimeUnit.SECONDS);
+    stream.setDeadline(overallDeadline);
+    stream.start(masterListener);
+
+    ArgumentCaptor<Deadline> deadlineCaptor = ArgumentCaptor.forClass(Deadline.class);
+    verify(mockStream1, times(2)).setDeadline(deadlineCaptor.capture());
+    assertThat(deadlineCaptor.getValue()).isNotEqualTo(overallDeadline);
+    long remaining = deadlineCaptor.getValue().timeRemaining(TimeUnit.MILLISECONDS);
+    assertThat(remaining).isAtLeast(4000L);
+    assertThat(remaining).isAtMost(6000L);
+
+    // Case 2: Overall deadline is shorter than per-attempt timeout (2s < 5s)
+    RetriableStream<String> stream2 = new RecordedRetriableStream(
+        method, new Metadata(), channelBufferUsed, PER_RPC_BUFFER_LIMIT, CHANNEL_BUFFER_LIMIT,
+        MoreExecutors.directExecutor(), fakeClock.getScheduledExecutorService(),
+        retryPolicy, null, null);
+
+    ClientStream mockStream2 = mock(ClientStream.class);
+    doReturn(mockStream2).when(retriableStreamRecorder).newSubstream(0);
+
+    Deadline overallDeadline2 = Deadline.after(2, TimeUnit.SECONDS);
+    stream2.setDeadline(overallDeadline2);
+    stream2.start(masterListener);
+
+    ArgumentCaptor<Deadline> deadlineCaptor2 = ArgumentCaptor.forClass(Deadline.class);
+    verify(mockStream2, times(2)).setDeadline(deadlineCaptor2.capture());
+    assertThat(deadlineCaptor2.getValue()).isEqualTo(overallDeadline2);
   }
 
   /**

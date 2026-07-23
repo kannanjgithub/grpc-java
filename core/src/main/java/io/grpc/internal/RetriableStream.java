@@ -123,6 +123,8 @@ abstract class RetriableStream<ReqT> implements ClientStream {
   private long nextBackoffIntervalNanos;
   private Status cancellationStatus;
   private boolean isClosed;
+  @GuardedBy("lock")
+  private Deadline overallDeadline;
 
   RetriableStream(
       MethodDescriptor<ReqT, ?> method, Metadata headers,
@@ -257,7 +259,11 @@ abstract class RetriableStream<ReqT> implements ClientStream {
         return null;
       }
     } while (!inFlightSubStreams.compareAndSet(inFlight, inFlight + 1));
-    Substream sub = new Substream(previousAttemptCount);
+    Deadline attemptDeadline = null;
+    if (retryPolicy != null && retryPolicy.perAttemptRecvTimeoutNanos != null) {
+      attemptDeadline = Deadline.after(retryPolicy.perAttemptRecvTimeoutNanos, TimeUnit.NANOSECONDS);
+    }
+    Substream sub = new Substream(previousAttemptCount, attemptDeadline);
     // one tracer per substream
     final ClientStreamTracer bufferSizeTracer = new BufferSizeTracer(sub);
     ClientStreamTracer.Factory tracerFactory = new ClientStreamTracer.Factory() {
@@ -272,6 +278,17 @@ abstract class RetriableStream<ReqT> implements ClientStream {
     // NOTICE: This set _must_ be done before stream.start() and it actually is.
     sub.stream = newSubstream(newHeaders, tracerFactory, previousAttemptCount, isTransparentRetry,
         isHedgedStream);
+
+    Deadline combinedDeadline = attemptDeadline;
+    synchronized (lock) {
+      if (overallDeadline != null) {
+        combinedDeadline = (attemptDeadline != null) ? overallDeadline.minimum(attemptDeadline) : overallDeadline;
+      }
+    }
+    if (combinedDeadline != null) {
+      sub.stream.setDeadline(combinedDeadline);
+    }
+
     return sub;
   }
 
@@ -751,10 +768,17 @@ abstract class RetriableStream<ReqT> implements ClientStream {
 
   @Override
   public final void setDeadline(final Deadline deadline) {
+    synchronized (lock) {
+      overallDeadline = deadline;
+    }
     class DeadlineEntry implements BufferEntry {
       @Override
       public void runWith(Substream substream) {
-        substream.stream.setDeadline(deadline);
+        Deadline combinedDeadline = deadline;
+        if (substream.attemptDeadline != null) {
+          combinedDeadline = deadline.minimum(substream.attemptDeadline);
+        }
+        substream.stream.setDeadline(combinedDeadline);
       }
     }
 
@@ -1382,9 +1406,15 @@ abstract class RetriableStream<ReqT> implements ClientStream {
     boolean bufferLimitExceeded;
 
     final int previousAttemptCount;
+    @Nullable final Deadline attemptDeadline;
 
     Substream(int previousAttemptCount) {
+      this(previousAttemptCount, null);
+    }
+
+    Substream(int previousAttemptCount, @Nullable Deadline attemptDeadline) {
       this.previousAttemptCount = previousAttemptCount;
+      this.attemptDeadline = attemptDeadline;
     }
   }
 
