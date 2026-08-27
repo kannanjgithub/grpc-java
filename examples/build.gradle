@@ -30,6 +30,7 @@ dependencies {
     // Even though client-side won't call grpc-services directly, it needs the
     // dependency to enable the health-aware round_robin implementation
     implementation "io.grpc:grpc-services:${grpcVersion}"
+    implementation "io.grpc:grpc-netty:${grpcVersion}"
     implementation "io.grpc:grpc-stub:${grpcVersion}"
 
     // examples/advanced need this for JsonFormat
@@ -46,7 +47,7 @@ dependencies {
 protobuf {
     protoc { artifact = "com.google.protobuf:protoc:${protocVersion}" }
     plugins {
-        grpc { artifact = "io.grpc:protoc-gen-grpc-java:${grpcVersion}" }
+        grpc { artifact = "io.grpc:protoc-gen-grpc-java:1.83.0" }
     }
     generateProtoTasks {
         all()*.plugins { grpc {} }
