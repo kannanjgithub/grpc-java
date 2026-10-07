@@ -1589,6 +1589,10 @@ final class ExternalProcessorClientInterceptor implements ClientInterceptor {
 
     void drainSavedMessages() {
       synchronized (dataPlaneClientCall.streamLock) {
+        if (dataPlaneClientCall.getCurrentProcessingMode().getResponseBodyMode()
+            != ProcessingMode.BodySendMode.GRPC) {
+          return;
+        }
         while (dataPlaneClientCall.isSidecarReady()
             && dataPlaneClientCall.upstreamToSidestreamWindow > 0
             && !savedMessages.isEmpty()) {
